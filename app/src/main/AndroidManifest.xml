@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="moe.shizuku.manager.permission.API" />
 
+    <!-- Android 11+ 包可见性：允许查询 Shizuku 是否已安装（M1 状态检测） -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:icon="@drawable/ic_cursor"
