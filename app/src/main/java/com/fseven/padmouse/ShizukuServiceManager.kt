@@ -109,6 +109,12 @@ class ShizukuServiceManager(
 
     fun shellExec(cmd: String): String = requireService().shellExec(cmd)
 
+    fun startGamepadCapture(listener: IGamepadListener) = requireService().startGamepadCapture(listener)
+
+    fun stopGamepadCapture() = requireService().stopGamepadCapture()
+
+    fun describeGamepads(): String = requireService().describeGamepads()
+
     private fun requireService(): IPadMouse =
         service ?: throw IllegalStateException("UserService 未连接，请先完成 Shizuku 授权")
 }

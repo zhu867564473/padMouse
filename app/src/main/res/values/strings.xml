@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M2：注入引擎（Shizuku UserService + InputManager 反射），支持注入自检与测试点击。</string>
+    <string name="main_placeholder_hint">M3：手柄捕获（读 /dev/input，不抢前台焦点），支持按键与摇杆归一化。</string>
 
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>
@@ -33,6 +33,17 @@
     <string name="inject_result_running">正在执行…</string>
     <string name="inject_result_tap_ok">已注入点击：(%1$d, %2$d)</string>
     <string name="inject_toast_not_ready">UserService 尚未就绪，请确认 Shizuku 已授权</string>
+
+    <string name="gamepad_card_title">手柄检测</string>
+    <string name="gamepad_summary_idle">尚未扫描手柄。连接手柄后会自动刷新。</string>
+    <string name="gamepad_summary_scanning">正在扫描 /dev/input…</string>
+    <string name="gamepad_axes_idle">轴：推摇杆后显示归一化值（-1.00..1.00）。</string>
+    <string name="gamepad_axes_value">轴: %1$s</string>
+    <string name="gamepad_action_refresh">刷新手柄</string>
+    <string name="gamepad_events_title">最近按键事件（最多 10 条）</string>
+    <string name="gamepad_events_idle">按键事件将显示在这里。</string>
+    <string name="gamepad_key_event">%1$s  code=%2$d  value=%3$d</string>
+    <string name="gamepad_toast_not_ready">UserService 尚未就绪，无法读取手柄</string>
 
     <string name="status_overlay">悬浮窗权限：未授予</string>
     <string name="status_service">前台服务：未运行</string>

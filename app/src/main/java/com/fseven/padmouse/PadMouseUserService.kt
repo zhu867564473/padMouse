@@ -21,6 +21,10 @@ class PadMouseUserService : IPadMouse.Stub() {
     private val inputManager: Any? by lazy { resolveInputManager() }
     private val injectMethod: Method? by lazy { resolveInjectMethod() }
 
+    /** 手柄读取器：捕获线程、热插拔重扫全部在 UserService 进程内。 */
+    private val gamepadLock = Any()
+    private var gamepadReader: GamepadReader? = null
+
     /** 触摸手势状态，保证 MOVE/UP 复用 DOWN 的 downTime。 */
     private val gestureLock = Any()
     private var pointerDown = false
@@ -109,6 +113,26 @@ class PadMouseUserService : IPadMouse.Stub() {
     override fun sendKey(keyCode: Int) {
         val result = shellExec("input keyevent $keyCode")
         if (result.startsWith("ERROR")) throw IllegalStateException(result)
+    }
+
+    override fun startGamepadCapture(listener: IGamepadListener?) {
+        val target = listener ?: return
+        synchronized(gamepadLock) {
+            gamepadReader?.stop()
+            gamepadReader = GamepadReader(target).also { it.start() }
+        }
+    }
+
+    override fun stopGamepadCapture() {
+        synchronized(gamepadLock) {
+            gamepadReader?.stop()
+            gamepadReader = null
+        }
+    }
+
+    override fun describeGamepads(): String {
+        val reader = synchronized(gamepadLock) { gamepadReader }
+        return reader?.describe() ?: GamepadReader.describeOnce()
     }
 
     override fun shellExec(cmd: String): String {

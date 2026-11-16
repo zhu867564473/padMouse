@@ -11,6 +11,9 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -30,9 +33,46 @@ class MainActivity : AppCompatActivity() {
     private lateinit var selfTestButton: Button
     private lateinit var testTapButton: Button
     private lateinit var injectResult: TextView
+    private lateinit var gamepadSummary: TextView
+    private lateinit var gamepadAxes: TextView
+    private lateinit var gamepadEvents: TextView
+    private lateinit var gamepadRefreshButton: Button
 
     /** binder 调用与 shell 命令放到后台线程，避免阻塞 UI。 */
     private val injectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    private val gamepadTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val gamepadKeyEvents = ArrayDeque<String>()
+    private val gamepadAxisValues = LinkedHashMap<Int, Float>()
+    private var gamepadCaptureStarted = false
+    private var axisRenderScheduled = false
+
+    /** shell 侧回传的手柄事件；oneway 回调可能来自 Binder 线程，统一切回 UI。 */
+    private val gamepadListener = object : IGamepadListener.Stub() {
+        override fun onEvent(type: Int, code: Int, value: Int) {
+            if (type != 1) return // EV_KEY
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                addGamepadKeyEvent(code, value)
+            }
+        }
+
+        override fun onAxis(code: Int, normalized: Float) {
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                gamepadAxisValues[code] = normalized
+                scheduleAxisRender()
+            }
+        }
+
+        override fun onDeviceInfo(summary: String?) {
+            if (summary.isNullOrBlank()) return
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                gamepadSummary.text = summary
+            }
+        }
+    }
 
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
@@ -66,6 +106,10 @@ class MainActivity : AppCompatActivity() {
         selfTestButton = findViewById(R.id.button_self_test)
         testTapButton = findViewById(R.id.button_test_tap)
         injectResult = findViewById(R.id.inject_result)
+        gamepadSummary = findViewById(R.id.gamepad_summary)
+        gamepadAxes = findViewById(R.id.gamepad_axes)
+        gamepadEvents = findViewById(R.id.gamepad_events)
+        gamepadRefreshButton = findViewById(R.id.button_refresh_gamepad)
 
         serviceManager = ShizukuServiceManager(this) { state ->
             runOnUiThread { renderUserServiceState(state) }
@@ -76,6 +120,7 @@ class MainActivity : AppCompatActivity() {
         installButton.setOnClickListener { openShizukuInstallPage() }
         selfTestButton.setOnClickListener { runSelfTest() }
         testTapButton.setOnClickListener { runTestTap() }
+        gamepadRefreshButton.setOnClickListener { refreshGamepadInfo() }
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
         renderUserServiceState(UserServiceState.CONNECTING)
@@ -90,6 +135,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        gamepadCaptureStarted = false
+        runCatching { serviceManager.stopGamepadCapture() }
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
         serviceManager.stop()
         injectExecutor.shutdownNow()
@@ -132,6 +179,12 @@ class MainActivity : AppCompatActivity() {
         val ready = state == UserServiceState.READY
         selfTestButton.isEnabled = ready
         testTapButton.isEnabled = ready
+        gamepadRefreshButton.isEnabled = ready
+        if (ready) {
+            startGamepadCaptureIfNeeded()
+        } else {
+            gamepadCaptureStarted = false
+        }
         injectServiceStatus.setText(
             when (state) {
                 UserServiceState.CONNECTING -> R.string.inject_service_status_connecting
@@ -180,6 +233,71 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun startGamepadCaptureIfNeeded() {
+        if (gamepadCaptureStarted || !serviceManager.isReady) return
+        gamepadKeyEvents.clear()
+        gamepadAxisValues.clear()
+        gamepadEvents.setText(R.string.gamepad_events_idle)
+        gamepadAxes.setText(R.string.gamepad_axes_idle)
+        gamepadSummary.setText(R.string.gamepad_summary_scanning)
+        try {
+            serviceManager.startGamepadCapture(gamepadListener)
+            gamepadCaptureStarted = true
+            refreshGamepadInfo()
+        } catch (_: Throwable) {
+            gamepadCaptureStarted = false
+        }
+    }
+
+    private fun refreshGamepadInfo() {
+        if (!serviceManager.isReady) {
+            Toast.makeText(this, R.string.gamepad_toast_not_ready, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!gamepadCaptureStarted) startGamepadCaptureIfNeeded()
+        gamepadSummary.setText(R.string.gamepad_summary_scanning)
+        injectExecutor.execute {
+            val text = try {
+                serviceManager.describeGamepads()
+            } catch (t: Throwable) {
+                "扫描手柄失败: ${t.javaClass.simpleName}: ${t.message}"
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                gamepadSummary.text = text
+            }
+        }
+    }
+
+    private fun addGamepadKeyEvent(code: Int, value: Int) {
+        val time = gamepadTimeFormat.format(Date())
+        gamepadKeyEvents.addFirst(getString(R.string.gamepad_key_event, time, code, value))
+        while (gamepadKeyEvents.size > GAMEPAD_EVENT_LIMIT) gamepadKeyEvents.removeLast()
+        gamepadEvents.text = gamepadKeyEvents.joinToString("\n")
+    }
+
+    /** 摇杆事件高频，合并到约 20fps 再刷新 UI。 */
+    private fun scheduleAxisRender() {
+        if (axisRenderScheduled) return
+        axisRenderScheduled = true
+        gamepadAxes.postDelayed({
+            axisRenderScheduled = false
+            if (isFinishing || isDestroyed) return@postDelayed
+            renderAxes()
+        }, AXIS_RENDER_INTERVAL_MS)
+    }
+
+    private fun renderAxes() {
+        if (gamepadAxisValues.isEmpty()) return
+        val values = gamepadAxisValues.entries
+            .sortedBy { it.key }
+            .joinToString("   ") { (code, value) ->
+                val name = GamepadAxes.NAMES[code] ?: "code=0x${code.toString(16)}"
+                "$name=${String.format(Locale.US, "%.2f", value)}"
+            }
+        gamepadAxes.text = getString(R.string.gamepad_axes_value, values)
+    }
+
     private fun showHint(resId: Int) {
         hintText.setText(resId)
         hintText.visibility = View.VISIBLE
@@ -190,6 +308,11 @@ class MainActivity : AppCompatActivity() {
             // 状态可能已变化（服务被杀/已授权），刷新界面而非静默失败。
             renderStatus()
         }
+    }
+
+    companion object {
+        private const val GAMEPAD_EVENT_LIMIT = 10
+        private const val AXIS_RENDER_INTERVAL_MS = 50L
     }
 
     private fun openShizukuInstallPage() {
