@@ -122,6 +122,7 @@
     <string name="cursor_toast_need_overlay">请先授予悬浮窗权限</string>
     <string name="cursor_toast_start_failed">启动光标服务失败</string>
     <string name="cursor_toast_no_settings">无法打开悬浮窗权限设置</string>
+    <string name="cursor_toast_notification_denied">未授予通知权限：光标仍可使用，但通知栏的「停止」入口不会显示</string>
 
     <string name="notification_channel_name">手柄鼠标服务</string>
     <string name="notification_text">光标悬浮窗运行中</string>

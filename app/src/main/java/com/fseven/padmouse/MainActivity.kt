@@ -1,10 +1,12 @@
 package com.fseven.padmouse
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
@@ -19,6 +21,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import rikka.shizuku.Shizuku
 import java.text.SimpleDateFormat
@@ -282,6 +285,18 @@ class MainActivity : AppCompatActivity() {
         syncCursorToggle()
         serviceManager.bindNow()
         syncMapper()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQUEST_NOTIFICATIONS) return
+        if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, R.string.cursor_toast_notification_denied, Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onDestroy() {
@@ -674,7 +689,23 @@ class MainActivity : AppCompatActivity() {
             requestOverlayPermission()
             return
         }
+        requestNotificationPermissionIfNeeded()
         startCursorService()
+    }
+
+    /** Android 13+ 需要运行时授权才能展示前台服务通知（含「停止」action）。 */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) return
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            REQUEST_NOTIFICATIONS
+        )
     }
 
     private fun startCursorService() {
@@ -868,6 +899,7 @@ class MainActivity : AppCompatActivity() {
         private const val MIN_IDLE_SECONDS = 1
         private const val MAX_IDLE_SECONDS = 10
         private const val DEFAULT_IDLE_SECONDS = 3
+        private const val REQUEST_NOTIFICATIONS = 1001
     }
 
     private fun openShizukuInstallPage() {

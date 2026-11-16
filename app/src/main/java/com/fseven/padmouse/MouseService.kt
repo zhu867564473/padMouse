@@ -1,5 +1,6 @@
 package com.fseven.padmouse
 
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -20,6 +21,7 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.core.app.ServiceCompat
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -53,12 +55,12 @@ class MouseService : Service() {
     /** 窗口是否已经成功 addView，避免重复 remove。 */
     private var overlayAdded = false
 
+    /** 窗口级透明度动画；同时决定输入使用的 opacity。 */
+    private var windowAlphaAnimator: ValueAnimator? = null
+
     private val idleHideRunnable = Runnable {
-        // 静止超时：降低透明度而不是完全隐藏，保留一个可感知的落点。
-        cursorView?.let { view ->
-            view.animate().cancel()
-            view.animate().alpha(IDLE_ALPHA).setDuration(FADE_OUT_MS).start()
-        }
+        // 静止超时：降低窗口 alpha（不是 View alpha），保留一个可感知的落点。
+        animateWindowAlpha(IDLE_WINDOW_ALPHA, FADE_OUT_MS)
     }
 
     inner class LocalBinder : Binder() {
@@ -147,6 +149,9 @@ class MouseService : Service() {
             x = max(0, ((screenWidth - cursorWidthPx) / 2f).roundToInt())
             y = max(0, ((screenHeight - cursorHeightPx) / 2f).roundToInt())
             windowAnimations = 0
+            // Android 12+ 会拦截不经系统授信的 overlay 的穿透触摸，
+            // 当窗口 opacity > 0.8 时箭头矩形内的点击会被吞掉；保持 0.79 以确保 FLAG_NOT_TOUCHABLE 生效。
+            alpha = ACTIVE_WINDOW_ALPHA
         }
 
         cursorX = params.x.toFloat()
@@ -164,7 +169,6 @@ class MouseService : Service() {
         layoutParams = params
         overlayAdded = true
         isRunning = true
-        view.alpha = 1f
         scheduleIdleHide()
     }
 
@@ -217,6 +221,8 @@ class MouseService : Service() {
 
     private fun removeOverlay() {
         handler.removeCallbacks(idleHideRunnable)
+        windowAlphaAnimator?.cancel()
+        windowAlphaAnimator = null
         val view = cursorView
         cursorView = null
         layoutParams = null
@@ -224,7 +230,6 @@ class MouseService : Service() {
             overlayAdded = false
             return
         }
-        view.animate().cancel()
         if (overlayAdded && view.isAttachedToWindow) {
             try {
                 windowManager.removeView(view)
@@ -264,13 +269,44 @@ class MouseService : Service() {
     }
 
     private fun showCursorNow() {
-        val view = cursorView ?: return
+        if (cursorView == null) return
         handler.removeCallbacks(idleHideRunnable)
-        if (view.alpha < 1f) {
-            view.animate().cancel()
-            view.animate().alpha(1f).setDuration(FADE_IN_MS).start()
-        }
+        animateWindowAlpha(ACTIVE_WINDOW_ALPHA, FADE_IN_MS)
         scheduleIdleHide()
+    }
+
+    /**
+     * 修改 WindowManager.LayoutParams.alpha（不是 View alpha），
+     * 这样静止变淡时窗口的输入透明度也同步下降。
+     */
+    private fun animateWindowAlpha(targetAlpha: Float, durationMs: Long) {
+        val params = layoutParams ?: return
+        val view = cursorView ?: return
+        windowAlphaAnimator?.cancel()
+        val startAlpha = params.alpha
+        if (abs(startAlpha - targetAlpha) < 0.01f) {
+            params.alpha = targetAlpha
+            if (overlayAdded && view.isAttachedToWindow) {
+                runCatching { windowManager.updateViewLayout(view, params) }
+            }
+            return
+        }
+        val animator = ValueAnimator.ofFloat(startAlpha, targetAlpha).apply {
+            duration = durationMs
+            addUpdateListener { animation ->
+                params.alpha = animation.animatedValue as Float
+                if (overlayAdded && view.isAttachedToWindow) {
+                    try {
+                        windowManager.updateViewLayout(view, params)
+                    } catch (e: IllegalArgumentException) {
+                        Log.d(TAG, "窗口 alpha 动画期间视图已 detach", e)
+                        cancel()
+                    }
+                }
+            }
+        }
+        animator.start()
+        windowAlphaAnimator = animator
     }
 
     private fun scheduleIdleHide() {
@@ -367,7 +403,9 @@ class MouseService : Service() {
         private const val REQUEST_STOP = 1
         private const val REQUEST_OPEN = 2
 
-        private const val IDLE_ALPHA = 0.15f
+        /** 激活态窗口透明度必须 <= 0.8，否则 Android 12+ 会拦截穿透触摸。 */
+        private const val ACTIVE_WINDOW_ALPHA = 0.79f
+        private const val IDLE_WINDOW_ALPHA = 0.15f
         private const val FADE_IN_MS = 120L
         private const val FADE_OUT_MS = 200L
 
