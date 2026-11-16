@@ -1,5 +1,6 @@
 package com.fseven.padmouse
 
+import android.os.Build
 import android.os.IBinder
 import android.os.Process
 import android.os.SystemClock
@@ -151,6 +152,9 @@ class PadMouseUserService : IPadMouse.Stub() {
     override fun selfTest(): String {
         val sb = StringBuilder()
         sb.append("uid=").append(Process.myUid()).append(" (shell=2000)  pid=").append(Process.myPid())
+        sb.append('\n')
+        sb.append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+            .append("  android=").append(Build.VERSION.RELEASE).append(" (sdk ").append(Build.VERSION.SDK_INT).append(")")
         sb.append('\n')
 
         val manager = inputManager
