@@ -2,8 +2,26 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M0 工程骨架：仅展示占位状态，暂无功能。</string>
-    <string name="status_shizuku">Shizuku 权限：未连接</string>
+    <string name="main_placeholder_hint">M1：Shizuku 授权接入；输入注入将在后续卡片实现。</string>
+
+    <string name="shizuku_status_label">Shizuku 状态</string>
+    <string name="shizuku_status_not_installed">未安装</string>
+    <string name="shizuku_status_not_running">未运行</string>
+    <string name="shizuku_status_not_granted">未授权</string>
+    <string name="shizuku_status_granted">已授权</string>
+
+    <string name="shizuku_action_refresh">刷新状态</string>
+    <string name="shizuku_action_request">申请授权</string>
+    <string name="shizuku_action_install">去安装 Shizuku</string>
+
+    <string name="shizuku_hint_not_installed">未检测到 Shizuku，请先安装后再返回本页刷新。</string>
+    <string name="shizuku_hint_not_running">请先用无线调试/root 启动 Shizuku 服务。</string>
+    <string name="shizuku_hint_not_granted">Shizuku 服务已运行，需要允许本应用使用 Shizuku。</string>
+
+    <string name="shizuku_toast_granted">Shizuku 授权成功</string>
+    <string name="shizuku_toast_denied">Shizuku 授权被拒绝</string>
+    <string name="shizuku_toast_no_store">未找到可打开的应用商店或浏览器</string>
+
     <string name="status_overlay">悬浮窗权限：未授予</string>
     <string name="status_service">前台服务：未运行</string>
     <string name="notification_channel_name">手柄鼠标服务</string>
