@@ -9,6 +9,12 @@ interface IPadMouse {
     void move(float x, float y);
     void up(float x, float y);
     void scroll(float x, float y, float h, float v);
+    // 鼠标键注入（M5）：右键/中键点击与按住/松开/拖拽移动。
+    void rightClick(float x, float y);
+    void middleClick(float x, float y);
+    void mouseDown(float x, float y, int button);
+    void mouseUp(float x, float y, int button);
+    void mouseMove(float x, float y, int buttonState);
     void sendKey(int keyCode);
     String shellExec(String cmd);
     String selfTest();

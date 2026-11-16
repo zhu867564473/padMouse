@@ -105,6 +105,16 @@ class ShizukuServiceManager(
 
     fun scroll(x: Float, y: Float, h: Float, v: Float) = requireService().scroll(x, y, h, v)
 
+    fun rightClick(x: Float, y: Float) = requireService().rightClick(x, y)
+
+    fun middleClick(x: Float, y: Float) = requireService().middleClick(x, y)
+
+    fun mouseDown(x: Float, y: Float, button: Int) = requireService().mouseDown(x, y, button)
+
+    fun mouseUp(x: Float, y: Float, button: Int) = requireService().mouseUp(x, y, button)
+
+    fun mouseMove(x: Float, y: Float, buttonState: Int) = requireService().mouseMove(x, y, buttonState)
+
     fun sendKey(keyCode: Int) = requireService().sendKey(keyCode)
 
     fun shellExec(cmd: String): String = requireService().shellExec(cmd)

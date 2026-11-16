@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M4：自绘光标悬浮窗，支持跟随移动、静止自动变淡、大小/颜色可调。</string>
+    <string name="main_placeholder_hint">M5：摇杆移动光标、A/B/X 按键、长按拖拽与右摇杆滚轮已接入，下方为实时映射调试面板。</string>
 
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>
@@ -44,6 +44,28 @@
     <string name="gamepad_events_idle">按键事件将显示在这里。</string>
     <string name="gamepad_key_event">%1$s  code=%2$d  value=%3$d</string>
     <string name="gamepad_toast_not_ready">UserService 尚未就绪，无法读取手柄</string>
+
+    <string name="mapping_card_title">映射引擎（调试）</string>
+    <string name="mapping_status_idle">映射未启动：打开光标后自动启用。</string>
+    <string name="mapping_status_running">映射运行中 · 死区 %1$.2f · 速度 %2$d px/s · 曲线 %3$.1f</string>
+    <string name="mapping_cursor_idle">光标: -</string>
+    <string name="mapping_cursor_value">光标: (%1$.0f, %2$.0f)</string>
+    <string name="mapping_vector_idle">左摇杆 (0.00, 0.00) · 右摇杆 (0.00, 0.00)</string>
+    <string name="mapping_vector_value">左摇杆 (%1$.2f, %2$.2f) · 右摇杆 (%3$.2f, %4$.2f)</string>
+    <string name="mapping_action_idle">最近动作: -</string>
+    <string name="mapping_action_value">最近动作: %1$s  @ %2$s</string>
+    <string name="mapping_action_tap">点击 (tap)</string>
+    <string name="mapping_action_right_click">右键 (rightClick)</string>
+    <string name="mapping_action_middle_click">中键 (middleClick)</string>
+    <string name="mapping_action_drag_start">拖拽开始 (drag down)</string>
+    <string name="mapping_action_drag_end">拖拽结束 (drag up)</string>
+    <string name="mapping_action_scroll_up">滚轮上 (scroll)</string>
+    <string name="mapping_action_scroll_down">滚轮下 (scroll)</string>
+    <string name="mapping_action_primary_hold">左键按住 (LT)</string>
+    <string name="mapping_action_primary_release">左键松开 (LT)</string>
+    <string name="mapping_action_secondary_hold">右键按住 (RT)</string>
+    <string name="mapping_action_secondary_release">右键松开 (RT)</string>
+    <string name="mapping_bindings_summary">默认绑定：A→点击 / 长按拖拽 · B→右键 · X→中键 · LT→左键按住 · RT→右键按住 · TL/TR→滚轮上/下 · 左摇杆移动 · 右摇杆滚轮</string>
 
     <string name="cursor_card_title">光标悬浮窗</string>
     <string name="cursor_overlay_permission_label">悬浮窗权限</string>

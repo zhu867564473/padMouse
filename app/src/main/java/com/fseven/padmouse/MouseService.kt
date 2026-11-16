@@ -253,6 +253,10 @@ class MouseService : Service() {
         handler.post { moveToInternal(cursorX + dx, cursorY + dy) }
     }
 
+    /** 当前光标坐标（窗口原点/箭头热点）；窗口未显示时返回 null。 */
+    fun currentPosition(): FloatArray? =
+        if (cursorView != null) floatArrayOf(cursorX, cursorY) else null
+
     private fun moveToInternal(x: Float, y: Float) {
         if (cursorView == null) return
         applyPosition(x, y, updateLayout = true)
@@ -383,5 +387,8 @@ class MouseService : Service() {
         fun moveBy(dx: Float, dy: Float) {
             instance?.moveBy(dx, dy)
         }
+
+        /** 供映射引擎（M5）读取当前光标坐标。 */
+        fun currentPosition(): FloatArray? = instance?.currentPosition()
     }
 }

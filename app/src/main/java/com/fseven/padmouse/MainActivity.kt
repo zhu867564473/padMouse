@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.RadioGroup
@@ -54,6 +55,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cursorIdleValue: TextView
     private lateinit var cursorColorGroup: RadioGroup
 
+    // M5 映射引擎调试面板
+    private lateinit var mappingStatus: TextView
+    private lateinit var mappingCursorValue: TextView
+    private lateinit var mappingVectorValue: TextView
+    private lateinit var mappingActionValue: TextView
+    private lateinit var mapper: Mapper
+
+    private var lastCursorX = 0f
+    private var lastCursorY = 0f
+    private var lastLeftX = 0f
+    private var lastLeftY = 0f
+    private var lastRightX = 0f
+    private var lastRightY = 0f
+    private var lastMapperAction: MapperAction? = null
+    private var lastMapperActionAt = 0L
+    private var mappingRenderScheduled = false
+
     /** 程序化同步开关时避免触发启动/停止逻辑。 */
     private var suppressCursorToggle = false
 
@@ -63,6 +81,55 @@ class MainActivity : AppCompatActivity() {
 
     /** binder 调用与 shell 命令放到后台线程，避免阻塞 UI。 */
     private val injectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /** Mapper 注入实现：统一切到单线程执行，保证 down/move/up 顺序。 */
+    private val mapperInjector = object : Mapper.Injector {
+        override fun tap(x: Float, y: Float) = dispatchInjection { serviceManager.tap(x, y) }
+
+        override fun rightClick(x: Float, y: Float) = dispatchInjection { serviceManager.rightClick(x, y) }
+
+        override fun middleClick(x: Float, y: Float) = dispatchInjection { serviceManager.middleClick(x, y) }
+
+        override fun touchDown(x: Float, y: Float) = dispatchInjection { serviceManager.down(x, y) }
+
+        override fun touchMove(x: Float, y: Float) = dispatchInjection { serviceManager.move(x, y) }
+
+        override fun touchUp(x: Float, y: Float) = dispatchInjection { serviceManager.up(x, y) }
+
+        override fun mouseDown(x: Float, y: Float, button: Int) =
+            dispatchInjection { serviceManager.mouseDown(x, y, button) }
+
+        override fun mouseUp(x: Float, y: Float, button: Int) =
+            dispatchInjection { serviceManager.mouseUp(x, y, button) }
+
+        override fun mouseMove(x: Float, y: Float, buttonState: Int) =
+            dispatchInjection { serviceManager.mouseMove(x, y, buttonState) }
+
+        override fun scroll(x: Float, y: Float, h: Float, v: Float) =
+            dispatchInjection { serviceManager.scroll(x, y, h, v) }
+    }
+
+    private val mapperListener = object : Mapper.Listener {
+        override fun onCursor(x: Float, y: Float) {
+            lastCursorX = x
+            lastCursorY = y
+            scheduleMappingRender()
+        }
+
+        override fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {
+            lastLeftX = leftX
+            lastLeftY = leftY
+            lastRightX = rightX
+            lastRightY = rightY
+            scheduleMappingRender()
+        }
+
+        override fun onAction(action: MapperAction, atMillis: Long) {
+            lastMapperAction = action
+            lastMapperActionAt = atMillis
+            scheduleMappingRender()
+        }
+    }
 
     private val gamepadTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val gamepadKeyEvents = ArrayDeque<String>()
@@ -77,6 +144,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 addGamepadKeyEvent(code, value)
+                if (::mapper.isInitialized) mapper.onKey(code, value)
             }
         }
 
@@ -85,6 +153,15 @@ class MainActivity : AppCompatActivity() {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 gamepadAxisValues[code] = normalized
                 scheduleAxisRender()
+                // 调试面板的摇杆向量即使映射未启动也刷新。
+                when (code) {
+                    GamepadAxes.ABS_X -> lastLeftX = normalized
+                    GamepadAxes.ABS_Y -> lastLeftY = normalized
+                    GamepadAxes.ABS_RX -> lastRightX = normalized
+                    GamepadAxes.ABS_RY -> lastRightY = normalized
+                }
+                if (::mapper.isInitialized) mapper.onAxis(code, normalized)
+                scheduleMappingRender()
             }
         }
 
@@ -141,10 +218,15 @@ class MainActivity : AppCompatActivity() {
         cursorIdleSeek = findViewById(R.id.seek_cursor_idle)
         cursorIdleValue = findViewById(R.id.cursor_idle_value)
         cursorColorGroup = findViewById(R.id.radio_group_cursor_color)
+        mappingStatus = findViewById(R.id.mapping_status)
+        mappingCursorValue = findViewById(R.id.mapping_cursor_value)
+        mappingVectorValue = findViewById(R.id.mapping_vector_value)
+        mappingActionValue = findViewById(R.id.mapping_action_value)
 
         serviceManager = ShizukuServiceManager(this) { state ->
             runOnUiThread { renderUserServiceState(state) }
         }
+        mapper = Mapper(mapperInjector, MapperConfig(), mapperListener)
 
         refreshButton.setOnClickListener { renderStatus() }
         requestButton.setOnClickListener { requestShizukuPermission() }
@@ -166,10 +248,12 @@ class MainActivity : AppCompatActivity() {
         updateOverlayPermissionUi()
         syncCursorToggle()
         serviceManager.bindNow()
+        syncMapper()
     }
 
     override fun onDestroy() {
         gamepadCaptureStarted = false
+        if (::mapper.isInitialized) mapper.stop()
         runCatching { serviceManager.stopGamepadCapture() }
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
         serviceManager.stop()
@@ -227,6 +311,7 @@ class MainActivity : AppCompatActivity() {
                 UserServiceState.FAILED -> R.string.inject_service_status_failed
             }
         )
+        syncMapper()
     }
 
     private fun runSelfTest() {
@@ -426,6 +511,9 @@ class MainActivity : AppCompatActivity() {
     private fun setCursorEnabled(enabled: Boolean) {
         if (!enabled) {
             stopService(Intent(this, MouseService::class.java))
+            if (::mapper.isInitialized) mapper.stop()
+            renderMappingStatus()
+            scheduleMappingRender()
             return
         }
         if (!Settings.canDrawOverlays(this)) {
@@ -445,6 +533,10 @@ class MainActivity : AppCompatActivity() {
             .putExtra(MouseService.EXTRA_IDLE_TIMEOUT_MS, selectedCursorIdleSeconds() * 1000L)
         try {
             ContextCompat.startForegroundService(this, intent)
+            // 服务启动是异步的，稍后再判断光标是否真正显示并启动映射。
+            mappingStatus.postDelayed({
+                if (!isFinishing && !isDestroyed) syncMapper()
+            }, MAPPING_START_DELAY_MS)
         } catch (t: Throwable) {
             Toast.makeText(this, R.string.cursor_toast_start_failed, Toast.LENGTH_SHORT).show()
             syncCursorToggle()
@@ -503,9 +595,99 @@ class MainActivity : AppCompatActivity() {
         else -> MouseService.COLOR_WHITE
     }
 
+    // ---------------------------------------------------------------- M5 映射引擎
+
+    /** 光标服务与 UserService 都就绪时自动启动 60Hz 映射。 */
+    private fun syncMapper() {
+        if (!::mapper.isInitialized) return
+        val shouldRun = serviceManager.isReady && MouseService.isRunning
+        if (shouldRun && !mapper.isRunning) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            mapper.start(bounds.width(), bounds.height())
+        } else if (!shouldRun && mapper.isRunning) {
+            mapper.stop()
+        }
+        renderMappingStatus()
+        scheduleMappingRender()
+    }
+
+    private fun renderMappingStatus() {
+        if (!::mapper.isInitialized || !mapper.isRunning) {
+            mappingStatus.setText(R.string.mapping_status_idle)
+            return
+        }
+        val config = mapper.configSnapshot
+        mappingStatus.text = getString(
+            R.string.mapping_status_running,
+            config.deadzone,
+            config.speedPxPerSec.toInt(),
+            config.exponent
+        )
+    }
+
+    private fun scheduleMappingRender() {
+        if (mappingRenderScheduled) return
+        mappingRenderScheduled = true
+        mappingCursorValue.postDelayed({
+            mappingRenderScheduled = false
+            if (isFinishing || isDestroyed) return@postDelayed
+            renderMappingPanel()
+        }, MAPPING_RENDER_INTERVAL_MS)
+    }
+
+    private fun renderMappingPanel() {
+        val running = ::mapper.isInitialized && mapper.isRunning
+        mappingCursorValue.text = if (running) {
+            getString(R.string.mapping_cursor_value, lastCursorX, lastCursorY)
+        } else {
+            getString(R.string.mapping_cursor_idle)
+        }
+        mappingVectorValue.text = getString(
+            R.string.mapping_vector_value,
+            lastLeftX, lastLeftY, lastRightX, lastRightY
+        )
+        val action = lastMapperAction
+        mappingActionValue.text = if (action == null) {
+            getString(R.string.mapping_action_idle)
+        } else {
+            getString(
+                R.string.mapping_action_value,
+                getString(actionLabelRes(action)),
+                gamepadTimeFormat.format(Date(lastMapperActionAt))
+            )
+        }
+    }
+
+    private fun actionLabelRes(action: MapperAction): Int = when (action) {
+        MapperAction.TAP -> R.string.mapping_action_tap
+        MapperAction.RIGHT_CLICK -> R.string.mapping_action_right_click
+        MapperAction.MIDDLE_CLICK -> R.string.mapping_action_middle_click
+        MapperAction.DRAG_START -> R.string.mapping_action_drag_start
+        MapperAction.DRAG_END -> R.string.mapping_action_drag_end
+        MapperAction.SCROLL_UP -> R.string.mapping_action_scroll_up
+        MapperAction.SCROLL_DOWN -> R.string.mapping_action_scroll_down
+        MapperAction.PRIMARY_HOLD -> R.string.mapping_action_primary_hold
+        MapperAction.PRIMARY_RELEASE -> R.string.mapping_action_primary_release
+        MapperAction.SECONDARY_HOLD -> R.string.mapping_action_secondary_hold
+        MapperAction.SECONDARY_RELEASE -> R.string.mapping_action_secondary_release
+    }
+
+    private fun dispatchInjection(block: () -> Unit) {
+        injectExecutor.execute {
+            try {
+                block()
+            } catch (t: Throwable) {
+                Log.w(TAG, "映射注入失败", t)
+            }
+        }
+    }
+
     companion object {
+        private const val TAG = "MainActivity"
         private const val GAMEPAD_EVENT_LIMIT = 10
         private const val AXIS_RENDER_INTERVAL_MS = 50L
+        private const val MAPPING_RENDER_INTERVAL_MS = 50L
+        private const val MAPPING_START_DELAY_MS = 400L
 
         private const val PREFS_CURSOR = "cursor_settings"
         private const val KEY_CURSOR_SIZE = "cursor_size_dp"

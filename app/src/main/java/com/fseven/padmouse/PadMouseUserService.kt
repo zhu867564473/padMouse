@@ -33,6 +33,12 @@ class PadMouseUserService : IPadMouse.Stub() {
     private var lastX = 0f
     private var lastY = 0f
 
+    /** 鼠标键手势状态（M5）：保证 MOVE/UP 复用 DOWN 的 downTime 与 buttonState。 */
+    private val mouseLock = Any()
+    private var mouseDown = false
+    private var mouseDownTime = 0L
+    private var mouseButtonState = 0
+
     override fun tap(x: Float, y: Float) {
         try {
             down(x, y)
@@ -108,6 +114,59 @@ class PadMouseUserService : IPadMouse.Stub() {
             inject(event)
         } finally {
             event.recycle()
+        }
+    }
+
+    override fun rightClick(x: Float, y: Float) {
+        clickMouse(x, y, MotionEvent.BUTTON_SECONDARY)
+    }
+
+    override fun middleClick(x: Float, y: Float) {
+        clickMouse(x, y, MotionEvent.BUTTON_TERTIARY)
+    }
+
+    override fun mouseDown(x: Float, y: Float, button: Int) {
+        synchronized(mouseLock) {
+            val now = SystemClock.uptimeMillis()
+            val first = !mouseDown
+            if (first) {
+                mouseDown = true
+                mouseDownTime = now
+            }
+            mouseButtonState = mouseButtonState or button
+            injectMouse(
+                if (first) MotionEvent.ACTION_DOWN else MotionEvent.ACTION_MOVE,
+                mouseDownTime, now, x, y, mouseButtonState
+            )
+        }
+    }
+
+    override fun mouseUp(x: Float, y: Float, button: Int) {
+        synchronized(mouseLock) {
+            val now = SystemClock.uptimeMillis()
+            if (!mouseDown) mouseDownTime = now
+            mouseButtonState = mouseButtonState and button.inv()
+            // UP 事件携带释放后的 buttonState（通常为 0）。
+            injectMouse(MotionEvent.ACTION_UP, mouseDownTime, now, x, y, mouseButtonState)
+            mouseDown = false
+            mouseButtonState = 0
+        }
+    }
+
+    override fun mouseMove(x: Float, y: Float, buttonState: Int) {
+        synchronized(mouseLock) {
+            val now = SystemClock.uptimeMillis()
+            val down = mouseDown || buttonState != 0
+            if (down && !mouseDown) {
+                mouseDown = true
+                mouseDownTime = now
+            }
+            if (down) mouseButtonState = buttonState
+            injectMouse(
+                if (down) MotionEvent.ACTION_MOVE else MotionEvent.ACTION_HOVER_MOVE,
+                if (down) mouseDownTime else now,
+                now, x, y, buttonState
+            )
         }
     }
 
@@ -188,6 +247,51 @@ class PadMouseUserService : IPadMouse.Stub() {
             if (manager != null && method != null) "可注入" else "不可注入（检查 Shizuku 授权/系统版本）"
         )
         return sb.toString()
+    }
+
+    /** 独立的右键/中键点击：DOWN + UP 一对，不干扰按住手势状态。 */
+    private fun clickMouse(x: Float, y: Float, button: Int) {
+        synchronized(mouseLock) {
+            val now = SystemClock.uptimeMillis()
+            injectMouse(MotionEvent.ACTION_DOWN, now, now, x, y, button)
+            injectMouse(MotionEvent.ACTION_UP, now, now + 1, x, y, 0)
+        }
+    }
+
+    /** 以 SOURCE_MOUSE 注入带 buttonState 的指针事件。 */
+    private fun injectMouse(
+        action: Int,
+        downTime: Long,
+        eventTime: Long,
+        x: Float,
+        y: Float,
+        buttonState: Int,
+    ) {
+        val properties = arrayOf(
+            MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = MotionEvent.TOOL_TYPE_MOUSE
+            }
+        )
+        val coords = arrayOf(
+            MotionEvent.PointerCoords().apply {
+                this.x = x
+                this.y = y
+                pressure = 1f
+                size = 1f
+            }
+        )
+        val event = MotionEvent.obtain(
+            downTime, eventTime, action,
+            1, properties, coords,
+            0, buttonState, 1f, 1f, 0, 0,
+            InputDevice.SOURCE_MOUSE, 0
+        )
+        try {
+            inject(event)
+        } finally {
+            event.recycle()
+        }
     }
 
     private fun injectTouch(action: Int, eventTime: Long, x: Float, y: Float) {
