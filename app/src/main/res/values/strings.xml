@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M5：摇杆移动光标、A/B/X 按键、长按拖拽与右摇杆滚轮已接入，下方为实时映射调试面板。</string>
+    <string name="main_placeholder_hint">M6：M5 鼠标映射之上新增系统动作（Back/Home/Recents、音量、亮度、截图），可在下方改绑手柄按键。</string>
 
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>
@@ -66,6 +66,42 @@
     <string name="mapping_action_secondary_hold">右键按住 (RT)</string>
     <string name="mapping_action_secondary_release">右键松开 (RT)</string>
     <string name="mapping_bindings_summary">默认绑定：A→点击 / 长按拖拽 · B→右键 · X→中键 · LT→左键按住 · RT→右键按住 · TL/TR→滚轮上/下 · 左摇杆移动 · 右摇杆滚轮</string>
+
+    <string name="system_card_title">系统动作绑定</string>
+    <string name="system_card_hint">为每个动作选择手柄按键，改动即时生效并保存；同一动作 200ms 内只触发一次。</string>
+    <string name="system_card_defaults_hint">默认：Start→Home · Select→Back · Xbox 键→最近任务 · 左摇杆按下→音量减 · 右摇杆按下→音量加 · 十字键上/下→亮度加/减 · LB+RB 同时按→截图</string>
+    <string name="system_action_back">返回 Back</string>
+    <string name="system_action_home">主屏 Home</string>
+    <string name="system_action_recents">最近任务 Recents</string>
+    <string name="system_action_volume_up">音量加</string>
+    <string name="system_action_volume_down">音量减</string>
+    <string name="system_action_brightness_up">亮度加</string>
+    <string name="system_action_brightness_down">亮度减</string>
+    <string name="system_action_screenshot">截图</string>
+    <string name="system_action_reset">恢复默认绑定</string>
+    <string name="system_action_reset_toast">已恢复默认系统动作绑定</string>
+    <string name="system_action_saved">已保存：%1$s → %2$s</string>
+
+    <string name="system_bind_start">Start 键</string>
+    <string name="system_bind_select">Select/View 键</string>
+    <string name="system_bind_mode">Xbox 键</string>
+    <string name="system_bind_thumbl">左摇杆按下</string>
+    <string name="system_bind_thumbr">右摇杆按下</string>
+    <string name="system_bind_tl">LB（TL）</string>
+    <string name="system_bind_tr">RB（TR）</string>
+    <string name="system_bind_a">A 键</string>
+    <string name="system_bind_b">B 键</string>
+    <string name="system_bind_x">X 键</string>
+    <string name="system_bind_dpad_up">十字键上（按键）</string>
+    <string name="system_bind_dpad_down">十字键下（按键）</string>
+    <string name="system_bind_dpad_left">十字键左（按键）</string>
+    <string name="system_bind_dpad_right">十字键右（按键）</string>
+    <string name="system_bind_hat_up">十字键上（ABS_HAT0Y）</string>
+    <string name="system_bind_hat_down">十字键下（ABS_HAT0Y）</string>
+    <string name="system_bind_hat_left">十字键左（ABS_HAT0X）</string>
+    <string name="system_bind_hat_right">十字键右（ABS_HAT0X）</string>
+    <string name="system_bind_chord_lb_rb">LB+RB 同时按下</string>
+    <string name="system_bind_custom">自定义绑定</string>
 
     <string name="cursor_card_title">光标悬浮窗</string>
     <string name="cursor_overlay_permission_label">悬浮窗权限</string>

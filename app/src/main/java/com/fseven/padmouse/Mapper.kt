@@ -1,5 +1,7 @@
 package com.fseven.padmouse
 
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.Choreographer
 import android.view.MotionEvent
@@ -30,6 +32,14 @@ enum class MapperAction {
     PRIMARY_RELEASE,
     SECONDARY_HOLD,
     SECONDARY_RELEASE,
+    SYSTEM_BACK,
+    SYSTEM_HOME,
+    SYSTEM_RECENTS,
+    SYSTEM_VOLUME_UP,
+    SYSTEM_VOLUME_DOWN,
+    SYSTEM_BRIGHTNESS_UP,
+    SYSTEM_BRIGHTNESS_DOWN,
+    SYSTEM_SCREENSHOT,
 }
 
 /**
@@ -55,6 +65,12 @@ data class MapperConfig(
     val scrollAxisY: Int = DefaultBindings.SCROLL_AXIS_Y,
     val buttonBindings: Map<Int, MouseAction> = DefaultBindings.BUTTON_ACTIONS,
     val axisBindings: Map<Int, MouseAction> = DefaultBindings.AXIS_ACTIONS,
+    /** M6 系统动作绑定；设置页修改后通过 [Mapper.updateConfig] 热更新。 */
+    val systemBindings: Map<SystemAction, ActionBinding> = DefaultBindings.SYSTEM_ACTIONS,
+    /** 同一系统动作的重复触发间隔（防误触）。 */
+    val systemDebounceMs: Long = DefaultBindings.SYSTEM_ACTION_DEBOUNCE_MS,
+    /** 组合键判定窗口。 */
+    val chordGraceMs: Long = DefaultBindings.CHORD_GRACE_MS,
 )
 
 /**
@@ -87,6 +103,9 @@ class Mapper(
         fun mouseUp(x: Float, y: Float, button: Int)
         fun mouseMove(x: Float, y: Float, buttonState: Int)
         fun scroll(x: Float, y: Float, h: Float, v: Float)
+
+        /** M6 系统动作；实现方负责转到后台线程执行 shell 命令。 */
+        fun systemAction(action: SystemAction)
     }
 
     /** 调试面板监听；全部在主线程回调。 */
@@ -120,6 +139,19 @@ class Mapper(
 
     private var primaryHeld = false
     private var secondaryHeld = false
+
+    /** 当前物理按下的键（用于组合键判定）。 */
+    private val heldKeys = LinkedHashSet<Int>()
+
+    /** 已由组合键消费的键：松开前不再触发单键动作。 */
+    private val chordConsumedKeys = HashSet<Int>()
+
+    /** 组合判定窗口内延迟执行的单键动作。 */
+    private val pendingKeyActions = HashMap<Int, Runnable>()
+    private val handler = Handler(Looper.getMainLooper())
+
+    /** 每个系统动作最近一次触发时间，用于 200ms 防抖。 */
+    private val lastSystemActionAt = HashMap<SystemAction, Long>()
 
     val isRunning: Boolean
         get() = running
@@ -157,6 +189,11 @@ class Mapper(
         dragging = false
         primaryHeld = false
         secondaryHeld = false
+        heldKeys.clear()
+        chordConsumedKeys.clear()
+        pendingKeyActions.values.forEach { handler.removeCallbacks(it) }
+        pendingKeyActions.clear()
+        lastSystemActionAt.clear()
         lastFrameNanos = 0L
         running = true
 
@@ -170,6 +207,10 @@ class Mapper(
         if (!running) return
         running = false
         choreographer.removeFrameCallback(frameCallback)
+        pendingKeyActions.values.forEach { handler.removeCallbacks(it) }
+        pendingKeyActions.clear()
+        heldKeys.clear()
+        chordConsumedKeys.clear()
         releaseAll()
     }
 
@@ -178,32 +219,137 @@ class Mapper(
     /** 按键事件：value = 1 按下 / 0 松开 / 2 自动重复。 */
     fun onKey(code: Int, value: Int) {
         if (!running || value == 2) return
+        if (value == 1) {
+            if (!heldKeys.add(code)) return
+            onKeyDown(code)
+        } else {
+            heldKeys.remove(code)
+            onKeyUp(code)
+        }
+    }
+
+    /**
+     * 按下处理顺序：组合键 → 单键系统动作 → M5 鼠标映射。
+     *
+     * 参与组合键的键先延迟 [MapperConfig.chordGraceMs] 再执行单键动作；
+     * 组合在窗口内成立时，只触发组合动作并吞掉成员的单键动作。
+     */
+    private fun onKeyDown(code: Int) {
+        val chord = config.systemBindings.entries.firstOrNull { (_, binding) ->
+            binding.isChordSatisfied(heldKeys)
+        }
+        if (chord != null) {
+            val binding = chord.value
+            cancelPending(binding.code)
+            cancelPending(binding.chordCode)
+            chordConsumedKeys.add(binding.code)
+            chordConsumedKeys.add(binding.chordCode)
+            triggerSystem(chord.key)
+            return
+        }
+
+        val system = systemBindingForKey(code)
+        if (system != null) {
+            if (participatesInChord(code)) {
+                schedulePending(code, config.chordGraceMs) { triggerSystem(system.key) }
+            } else {
+                triggerSystem(system.key)
+            }
+            return
+        }
+
         val action = config.buttonBindings[code] ?: return
         when (action) {
-            MouseAction.TAP -> handleTapKey(value)
-            MouseAction.RIGHT_CLICK -> if (value == 0) {
+            MouseAction.TAP -> handleTapKey(1)
+            // 右键/中键在松开时触发，避免组合判定窗口引入点击延迟。
+            MouseAction.RIGHT_CLICK, MouseAction.MIDDLE_CLICK -> Unit
+            MouseAction.SCROLL_UP, MouseAction.SCROLL_DOWN -> {
+                if (participatesInChord(code)) {
+                    schedulePending(code, config.chordGraceMs) { fireScroll(action) }
+                } else {
+                    fireScroll(action)
+                }
+            }
+
+            MouseAction.LEFT_HOLD, MouseAction.RIGHT_HOLD -> updateHold(action, 1f)
+        }
+    }
+
+    private fun onKeyUp(code: Int) {
+        if (chordConsumedKeys.remove(code)) return
+        // 组合未成立就松开：立即补发被延迟的单键动作，短按不丢。
+        flushPending(code)
+        // 系统动作优先于鼠标映射：该键绑定系统动作时，松开不再触发鼠标动作。
+        if (systemBindingForKey(code) != null) return
+        when (config.buttonBindings[code]) {
+            MouseAction.TAP -> handleTapKey(0)
+            MouseAction.RIGHT_CLICK -> {
                 injector.rightClick(cursorX, cursorY)
                 emit(MapperAction.RIGHT_CLICK)
             }
 
-            MouseAction.MIDDLE_CLICK -> if (value == 0) {
+            MouseAction.MIDDLE_CLICK -> {
                 injector.middleClick(cursorX, cursorY)
                 emit(MapperAction.MIDDLE_CLICK)
             }
 
-            MouseAction.SCROLL_UP -> if (value == 1) {
+            MouseAction.LEFT_HOLD -> updateHold(MouseAction.LEFT_HOLD, 0f)
+            MouseAction.RIGHT_HOLD -> updateHold(MouseAction.RIGHT_HOLD, 0f)
+            else -> Unit
+        }
+    }
+
+    private fun fireScroll(action: MouseAction) {
+        when (action) {
+            MouseAction.SCROLL_UP -> {
                 injector.scroll(cursorX, cursorY, 0f, -1f)
                 emit(MapperAction.SCROLL_UP)
             }
 
-            MouseAction.SCROLL_DOWN -> if (value == 1) {
+            MouseAction.SCROLL_DOWN -> {
                 injector.scroll(cursorX, cursorY, 0f, 1f)
                 emit(MapperAction.SCROLL_DOWN)
             }
 
-            MouseAction.LEFT_HOLD -> updateHold(action, if (value == 1) 1f else 0f)
-            MouseAction.RIGHT_HOLD -> updateHold(action, if (value == 1) 1f else 0f)
+            else -> Unit
         }
+    }
+
+    /** 组合键判定窗口：延迟执行，组合成立时由 [cancelPending] 取消。 */
+    private fun schedulePending(code: Int, delayMs: Long, block: () -> Unit) {
+        cancelPending(code)
+        val runnable = Runnable {
+            pendingKeyActions.remove(code)
+            if (running) block()
+        }
+        pendingKeyActions[code] = runnable
+        handler.postDelayed(runnable, delayMs)
+    }
+
+    private fun cancelPending(code: Int) {
+        pendingKeyActions.remove(code)?.let { handler.removeCallbacks(it) }
+    }
+
+    private fun flushPending(code: Int) {
+        val runnable = pendingKeyActions.remove(code) ?: return
+        handler.removeCallbacks(runnable)
+        runnable.run()
+    }
+
+    private fun participatesInChord(code: Int): Boolean =
+        config.systemBindings.values.any { it.isChord && it.involvesKey(code) }
+
+    private fun systemBindingForKey(code: Int): Map.Entry<SystemAction, ActionBinding>? =
+        config.systemBindings.entries.firstOrNull { (_, binding) -> binding.matchesKey(code) }
+
+    /** 触发系统动作；同一动作 200ms 内只执行一次。 */
+    private fun triggerSystem(action: SystemAction) {
+        val now = SystemClock.uptimeMillis()
+        val last = lastSystemActionAt[action]
+        if (last != null && now - last < config.systemDebounceMs) return
+        lastSystemActionAt[action] = now
+        injector.systemAction(action)
+        emit(mapperActionFor(action), now)
     }
 
     /** 轴事件：normalized 已由 GamepadReader 按 getevent 的 min/max 映射到 -1..1。 */
@@ -215,6 +361,15 @@ class Mapper(
             if (axisAction == MouseAction.LEFT_HOLD || axisAction == MouseAction.RIGHT_HOLD) {
                 updateHold(axisAction, normalized)
             }
+            return
+        }
+
+        // M6 系统动作轴触发（十字键上/下 → 亮度）：只有越过阈值才触发一次。
+        val systemAxis = config.systemBindings.entries.firstOrNull { (_, binding) ->
+            binding.matchesAxis(code, normalized)
+        }
+        if (systemAxis != null) {
+            triggerSystem(systemAxis.key)
             return
         }
 
@@ -381,6 +536,17 @@ class Mapper(
 
     private fun emit(action: MapperAction, atMillis: Long = SystemClock.uptimeMillis()) {
         listener?.onAction(action, atMillis)
+    }
+
+    private fun mapperActionFor(action: SystemAction): MapperAction = when (action) {
+        SystemAction.BACK -> MapperAction.SYSTEM_BACK
+        SystemAction.HOME -> MapperAction.SYSTEM_HOME
+        SystemAction.RECENTS -> MapperAction.SYSTEM_RECENTS
+        SystemAction.VOLUME_UP -> MapperAction.SYSTEM_VOLUME_UP
+        SystemAction.VOLUME_DOWN -> MapperAction.SYSTEM_VOLUME_DOWN
+        SystemAction.BRIGHTNESS_UP -> MapperAction.SYSTEM_BRIGHTNESS_UP
+        SystemAction.BRIGHTNESS_DOWN -> MapperAction.SYSTEM_BRIGHTNESS_DOWN
+        SystemAction.SCREENSHOT -> MapperAction.SYSTEM_SCREENSHOT
     }
 
     companion object {

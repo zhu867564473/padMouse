@@ -29,6 +29,15 @@ object DefaultBindings {
     /** 右摇杆推满时每秒滚轮格数。 */
     const val SCROLL_NOTCHES_PER_SEC = 8f
 
+    /** 系统动作防误触：同一动作触发后该时间内不重复触发。 */
+    const val SYSTEM_ACTION_DEBOUNCE_MS = 200L
+
+    /**
+     * 组合键判定窗口：参与组合的键按下后先等这么久，
+     * 期间组合成立则只触发组合动作，否则补发单键动作。
+     */
+    const val CHORD_GRACE_MS = 90L
+
     const val MOVE_AXIS_X = GamepadAxes.ABS_X
     const val MOVE_AXIS_Y = GamepadAxes.ABS_Y
     const val SCROLL_AXIS_X = GamepadAxes.ABS_RX
@@ -40,6 +49,21 @@ object DefaultBindings {
     const val BTN_X = 0x134 // BTN_WEST
     const val BTN_TL = 0x136
     const val BTN_TR = 0x137
+    const val BTN_SELECT = 0x13a
+    const val BTN_START = 0x13b
+    const val BTN_MODE = 0x13c
+    const val BTN_THUMBL = 0x13d
+    const val BTN_THUMBR = 0x13e
+
+    /** 十字键数字轴（上/左=-1，下/右=+1）。 */
+    const val AXIS_HAT0X = 16
+    const val AXIS_HAT0Y = 17
+
+    /** 部分手柄把十字键上报为独立按键。 */
+    const val BTN_DPAD_UP = 0x220
+    const val BTN_DPAD_DOWN = 0x221
+    const val BTN_DPAD_LEFT = 0x222
+    const val BTN_DPAD_RIGHT = 0x223
 
     /** 按键 → 鼠标动作。 */
     val BUTTON_ACTIONS: Map<Int, MouseAction> = linkedMapOf(
@@ -54,5 +78,25 @@ object DefaultBindings {
     val AXIS_ACTIONS: Map<Int, MouseAction> = linkedMapOf(
         GamepadAxes.ABS_Z to MouseAction.LEFT_HOLD,
         GamepadAxes.ABS_RZ to MouseAction.RIGHT_HOLD,
+    )
+
+    /**
+     * M6 系统动作默认绑定（Xbox 布局）：
+     * - Start → Home，Select → Back，Xbox 键 → Recents
+     * - 左摇杆按下 → 音量减，右摇杆按下 → 音量加
+     * - 十字键上/下 → 亮度加/减（ABS_HAT0Y 为数字轴）
+     * - LB+RB 同时按下 → 截图
+     *
+     * 单独按 LB/RB 仍是滚轮上/下；组合判定窗口见 [CHORD_GRACE_MS]。
+     */
+    val SYSTEM_ACTIONS: Map<SystemAction, ActionBinding> = linkedMapOf(
+        SystemAction.BACK to ActionBinding(BTN_SELECT),
+        SystemAction.HOME to ActionBinding(BTN_START),
+        SystemAction.RECENTS to ActionBinding(BTN_MODE),
+        SystemAction.VOLUME_DOWN to ActionBinding(BTN_THUMBL),
+        SystemAction.VOLUME_UP to ActionBinding(BTN_THUMBR),
+        SystemAction.BRIGHTNESS_UP to ActionBinding(AXIS_HAT0Y, direction = -1),
+        SystemAction.BRIGHTNESS_DOWN to ActionBinding(AXIS_HAT0Y, direction = 1),
+        SystemAction.SCREENSHOT to ActionBinding(BTN_TL, chordCode = BTN_TR),
     )
 }

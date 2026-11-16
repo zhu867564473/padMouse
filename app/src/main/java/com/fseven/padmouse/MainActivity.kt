@@ -9,8 +9,11 @@ import android.os.Bundle
 import android.provider.Settings
 import android.util.Log
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.RadioGroup
+import android.widget.Spinner
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -62,6 +65,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mappingActionValue: TextView
     private lateinit var mapper: Mapper
 
+    // M6 系统动作
+    private lateinit var settingsRepository: SettingsRepository
+    private lateinit var systemActions: SystemActions
+    private lateinit var systemBindingsResetButton: Button
+    private val systemSpinners = LinkedHashMap<SystemAction, Spinner>()
+    private var systemBindings: Map<SystemAction, ActionBinding> = DefaultBindings.SYSTEM_ACTIONS
+
     private var lastCursorX = 0f
     private var lastCursorY = 0f
     private var lastLeftX = 0f
@@ -108,6 +118,19 @@ class MainActivity : AppCompatActivity() {
 
         override fun scroll(x: Float, y: Float, h: Float, v: Float) =
             dispatchInjection { serviceManager.scroll(x, y, h, v) }
+
+        override fun systemAction(action: SystemAction) = dispatchInjection {
+            if (!serviceManager.isReady) {
+                Log.w(TAG, "系统动作 $action 跳过：UserService 未就绪")
+                return@dispatchInjection
+            }
+            val result = systemActions.run(action)
+            if (result.success) {
+                Log.i(TAG, "系统动作 $action 完成: ${result.commands.joinToString("; ")}")
+            } else {
+                Log.w(TAG, "系统动作 $action 失败: ${result.output}")
+            }
+        }
     }
 
     private val mapperListener = object : Mapper.Listener {
@@ -224,10 +247,18 @@ class MainActivity : AppCompatActivity() {
         mappingVectorValue = findViewById(R.id.mapping_vector_value)
         mappingActionValue = findViewById(R.id.mapping_action_value)
 
+        settingsRepository = SettingsRepository(this)
+        systemActions = SystemActions { cmd -> serviceManager.shellExec(cmd) }
+
         serviceManager = ShizukuServiceManager(this) { state ->
             runOnUiThread { renderUserServiceState(state) }
         }
-        mapper = Mapper(mapperInjector, MapperConfig(), mapperListener)
+        systemBindings = settingsRepository.loadSystemBindings()
+        mapper = Mapper(
+            mapperInjector,
+            MapperConfig(systemBindings = systemBindings),
+            mapperListener,
+        )
 
         refreshButton.setOnClickListener { renderStatus() }
         requestButton.setOnClickListener { requestShizukuPermission() }
@@ -235,6 +266,7 @@ class MainActivity : AppCompatActivity() {
         selfTestButton.setOnClickListener { runSelfTest() }
         testTapButton.setOnClickListener { runTestTap() }
         gamepadRefreshButton.setOnClickListener { refreshGamepadInfo() }
+        setupSystemBindings()
         setupCursorControls()
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
@@ -416,6 +448,124 @@ class MainActivity : AppCompatActivity() {
                 "$name=${String.format(Locale.US, "%.2f", value)}"
             }
         gamepadAxes.text = getString(R.string.gamepad_axes_value, values)
+    }
+
+    // ---------------------------------------------------------------- M6 系统动作
+
+    /** 8 个系统动作各一个下拉框；选中即保存并热更新 Mapper。 */
+    private fun setupSystemBindings() {
+        systemBindingsResetButton = findViewById(R.id.button_reset_system_bindings)
+        systemSpinners[SystemAction.BACK] = findViewById(R.id.spinner_system_back)
+        systemSpinners[SystemAction.HOME] = findViewById(R.id.spinner_system_home)
+        systemSpinners[SystemAction.RECENTS] = findViewById(R.id.spinner_system_recents)
+        systemSpinners[SystemAction.VOLUME_UP] = findViewById(R.id.spinner_system_volume_up)
+        systemSpinners[SystemAction.VOLUME_DOWN] = findViewById(R.id.spinner_system_volume_down)
+        systemSpinners[SystemAction.BRIGHTNESS_UP] = findViewById(R.id.spinner_system_brightness_up)
+        systemSpinners[SystemAction.BRIGHTNESS_DOWN] = findViewById(R.id.spinner_system_brightness_down)
+        systemSpinners[SystemAction.SCREENSHOT] = findViewById(R.id.spinner_system_screenshot)
+
+        for (action in SystemAction.values()) {
+            val spinner = systemSpinners[action] ?: continue
+            bindSystemActionSpinner(action, spinner)
+        }
+        systemBindingsResetButton.setOnClickListener {
+            settingsRepository.resetSystemBindings()
+            systemBindings = DefaultBindings.SYSTEM_ACTIONS
+            applySystemBindings()
+            for ((action, spinner) in systemSpinners) bindSystemActionSpinner(action, spinner)
+            Toast.makeText(this, R.string.system_action_reset_toast, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun bindSystemActionSpinner(action: SystemAction, spinner: Spinner) {
+        val options = bindingOptionsFor(action)
+        val labels = options.map { getString(it.labelRes) }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+        val current = systemBindings[action] ?: DefaultBindings.SYSTEM_ACTIONS.getValue(action)
+        spinner.setSelection(options.indexOfFirst { it.binding == current }.coerceAtLeast(0), false)
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val option = options.getOrNull(position) ?: return
+                if (systemBindings[action] == option.binding) return
+                systemBindings = systemBindings + (action to option.binding)
+                settingsRepository.saveSystemBinding(action, option.binding)
+                applySystemBindings()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(
+                        R.string.system_action_saved,
+                        getString(systemActionLabelRes(action)),
+                        getString(option.labelRes)
+                    ),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    /** 可选项：手柄实体键与十字键方向；截图额外提供 LB+RB 组合。 */
+    private fun bindingOptionsFor(action: SystemAction): List<BindingOption> {
+        val options = ArrayList<BindingOption>()
+        if (action == SystemAction.SCREENSHOT) {
+            options.add(
+                BindingOption(
+                    ActionBinding(DefaultBindings.BTN_TL, chordCode = DefaultBindings.BTN_TR),
+                    R.string.system_bind_chord_lb_rb
+                )
+            )
+        }
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_START), R.string.system_bind_start))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_SELECT), R.string.system_bind_select))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_MODE), R.string.system_bind_mode))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_THUMBL), R.string.system_bind_thumbl))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_THUMBR), R.string.system_bind_thumbr))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_TL), R.string.system_bind_tl))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_TR), R.string.system_bind_tr))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_A), R.string.system_bind_a))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_B), R.string.system_bind_b))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_X), R.string.system_bind_x))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_UP), R.string.system_bind_dpad_up))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_DOWN), R.string.system_bind_dpad_down))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_LEFT), R.string.system_bind_dpad_left))
+        options.add(BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_RIGHT), R.string.system_bind_dpad_right))
+        options.add(
+            BindingOption(ActionBinding(DefaultBindings.AXIS_HAT0Y, direction = -1), R.string.system_bind_hat_up)
+        )
+        options.add(
+            BindingOption(ActionBinding(DefaultBindings.AXIS_HAT0Y, direction = 1), R.string.system_bind_hat_down)
+        )
+        options.add(
+            BindingOption(ActionBinding(DefaultBindings.AXIS_HAT0X, direction = -1), R.string.system_bind_hat_left)
+        )
+        options.add(
+            BindingOption(ActionBinding(DefaultBindings.AXIS_HAT0X, direction = 1), R.string.system_bind_hat_right)
+        )
+        // 已保存但不在候选表里的绑定（例如旧版本自定义）仍可见、不被覆盖。
+        val current = systemBindings[action]
+        if (current != null && options.none { it.binding == current }) {
+            options.add(0, BindingOption(current, R.string.system_bind_custom))
+        }
+        return options
+    }
+
+    private fun applySystemBindings() {
+        if (!::mapper.isInitialized) return
+        mapper.updateConfig(mapper.configSnapshot.copy(systemBindings = systemBindings))
+    }
+
+    private fun systemActionLabelRes(action: SystemAction): Int = when (action) {
+        SystemAction.BACK -> R.string.system_action_back
+        SystemAction.HOME -> R.string.system_action_home
+        SystemAction.RECENTS -> R.string.system_action_recents
+        SystemAction.VOLUME_UP -> R.string.system_action_volume_up
+        SystemAction.VOLUME_DOWN -> R.string.system_action_volume_down
+        SystemAction.BRIGHTNESS_UP -> R.string.system_action_brightness_up
+        SystemAction.BRIGHTNESS_DOWN -> R.string.system_action_brightness_down
+        SystemAction.SCREENSHOT -> R.string.system_action_screenshot
     }
 
     private fun showHint(resId: Int) {
@@ -683,6 +833,14 @@ class MainActivity : AppCompatActivity() {
         MapperAction.PRIMARY_RELEASE -> R.string.mapping_action_primary_release
         MapperAction.SECONDARY_HOLD -> R.string.mapping_action_secondary_hold
         MapperAction.SECONDARY_RELEASE -> R.string.mapping_action_secondary_release
+        MapperAction.SYSTEM_BACK -> R.string.system_action_back
+        MapperAction.SYSTEM_HOME -> R.string.system_action_home
+        MapperAction.SYSTEM_RECENTS -> R.string.system_action_recents
+        MapperAction.SYSTEM_VOLUME_UP -> R.string.system_action_volume_up
+        MapperAction.SYSTEM_VOLUME_DOWN -> R.string.system_action_volume_down
+        MapperAction.SYSTEM_BRIGHTNESS_UP -> R.string.system_action_brightness_up
+        MapperAction.SYSTEM_BRIGHTNESS_DOWN -> R.string.system_action_brightness_down
+        MapperAction.SYSTEM_SCREENSHOT -> R.string.system_action_screenshot
     }
 
     private fun dispatchInjection(block: () -> Unit) {
@@ -724,3 +882,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 }
+
+/** 系统动作下拉框候选项。 */
+private data class BindingOption(val binding: ActionBinding, val labelRes: Int)
