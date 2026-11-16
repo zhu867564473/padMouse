@@ -71,6 +71,7 @@ class MainActivity : AppCompatActivity() {
     private var lastMapperAction: MapperAction? = null
     private var lastMapperActionAt = 0L
     private var mappingRenderScheduled = false
+    private var mappingStartAttempts = 0
 
     /** 程序化同步开关时避免触发启动/停止逻辑。 */
     private var suppressCursorToggle = false
@@ -511,6 +512,7 @@ class MainActivity : AppCompatActivity() {
     private fun setCursorEnabled(enabled: Boolean) {
         if (!enabled) {
             stopService(Intent(this, MouseService::class.java))
+            mappingStartAttempts = MAPPING_MAX_START_ATTEMPTS
             if (::mapper.isInitialized) mapper.stop()
             renderMappingStatus()
             scheduleMappingRender()
@@ -533,10 +535,9 @@ class MainActivity : AppCompatActivity() {
             .putExtra(MouseService.EXTRA_IDLE_TIMEOUT_MS, selectedCursorIdleSeconds() * 1000L)
         try {
             ContextCompat.startForegroundService(this, intent)
-            // 服务启动是异步的，稍后再判断光标是否真正显示并启动映射。
-            mappingStatus.postDelayed({
-                if (!isFinishing && !isDestroyed) syncMapper()
-            }, MAPPING_START_DELAY_MS)
+            // 服务启动是异步的；轮询等待光标真正显示后再启动映射。
+            mappingStartAttempts = 0
+            scheduleMapperStart()
         } catch (t: Throwable) {
             Toast.makeText(this, R.string.cursor_toast_start_failed, Toast.LENGTH_SHORT).show()
             syncCursorToggle()
@@ -598,6 +599,18 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- M5 映射引擎
 
     /** 光标服务与 UserService 都就绪时自动启动 60Hz 映射。 */
+    /** 光标服务冷启动可能超过一个延迟周期，未就绪时继续重试，直到上限。 */
+    private fun scheduleMapperStart() {
+        mappingStatus.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            syncMapper()
+            if (!mapper.isRunning && mappingStartAttempts < MAPPING_MAX_START_ATTEMPTS) {
+                mappingStartAttempts++
+                scheduleMapperStart()
+            }
+        }, MAPPING_START_DELAY_MS)
+    }
+
     private fun syncMapper() {
         if (!::mapper.isInitialized) return
         val shouldRun = serviceManager.isReady && MouseService.isRunning
@@ -688,6 +701,7 @@ class MainActivity : AppCompatActivity() {
         private const val AXIS_RENDER_INTERVAL_MS = 50L
         private const val MAPPING_RENDER_INTERVAL_MS = 50L
         private const val MAPPING_START_DELAY_MS = 400L
+        private const val MAPPING_MAX_START_ATTEMPTS = 8
 
         private const val PREFS_CURSOR = "cursor_settings"
         private const val KEY_CURSOR_SIZE = "cursor_size_dp"
