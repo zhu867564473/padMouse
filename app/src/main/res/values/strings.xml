@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M1：Shizuku 授权接入；输入注入将在后续卡片实现。</string>
+    <string name="main_placeholder_hint">M2：注入引擎（Shizuku UserService + InputManager 反射），支持注入自检与测试点击。</string>
 
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>
@@ -21,6 +21,18 @@
     <string name="shizuku_toast_granted">Shizuku 授权成功</string>
     <string name="shizuku_toast_denied">Shizuku 授权被拒绝</string>
     <string name="shizuku_toast_no_store">未找到可打开的应用商店或浏览器</string>
+
+    <string name="inject_card_title">输入注入</string>
+    <string name="inject_service_status_connecting">UserService：连接中…</string>
+    <string name="inject_service_status_ready">UserService：已连接</string>
+    <string name="inject_service_status_disconnected">UserService：已断开，请刷新状态或重新授权</string>
+    <string name="inject_service_status_failed">UserService：绑定失败</string>
+    <string name="inject_action_self_test">注入自检</string>
+    <string name="inject_action_test_tap">测试点击屏幕中心</string>
+    <string name="inject_result_idle">自检结果将显示在这里。</string>
+    <string name="inject_result_running">正在执行…</string>
+    <string name="inject_result_tap_ok">已注入点击：(%1$d, %2$d)</string>
+    <string name="inject_toast_not_ready">UserService 尚未就绪，请确认 Shizuku 已授权</string>
 
     <string name="status_overlay">悬浮窗权限：未授予</string>
     <string name="status_service">前台服务：未运行</string>
