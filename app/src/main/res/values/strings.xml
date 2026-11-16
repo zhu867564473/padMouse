@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">手柄鼠标</string>
+    <string name="main_title">手柄鼠标</string>
+    <string name="main_placeholder_hint">M0 工程骨架：仅展示占位状态，暂无功能。</string>
+    <string name="status_shizuku">Shizuku 权限：未连接</string>
+    <string name="status_overlay">悬浮窗权限：未授予</string>
+    <string name="status_service">前台服务：未运行</string>
+    <string name="notification_channel_name">手柄鼠标服务</string>
+    <string name="notification_text">前台服务运行中</string>
+</resources>
