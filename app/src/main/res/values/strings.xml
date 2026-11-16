@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">手柄鼠标</string>
     <string name="main_title">手柄鼠标</string>
-    <string name="main_placeholder_hint">M3：手柄捕获（读 /dev/input，不抢前台焦点），支持按键与摇杆归一化。</string>
+    <string name="main_placeholder_hint">M4：自绘光标悬浮窗，支持跟随移动、静止自动变淡、大小/颜色可调。</string>
 
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>
@@ -45,8 +45,27 @@
     <string name="gamepad_key_event">%1$s  code=%2$d  value=%3$d</string>
     <string name="gamepad_toast_not_ready">UserService 尚未就绪，无法读取手柄</string>
 
-    <string name="status_overlay">悬浮窗权限：未授予</string>
-    <string name="status_service">前台服务：未运行</string>
+    <string name="cursor_card_title">光标悬浮窗</string>
+    <string name="cursor_overlay_permission_label">悬浮窗权限</string>
+    <string name="cursor_overlay_granted">已授予</string>
+    <string name="cursor_overlay_denied">未授予</string>
+    <string name="cursor_action_grant_overlay">授予悬浮窗权限</string>
+    <string name="cursor_action_toggle">显示光标（悬浮窗）</string>
+    <string name="cursor_size_label">光标大小</string>
+    <string name="cursor_size_value">%1$d dp</string>
+    <string name="cursor_size_value_default">28 dp</string>
+    <string name="cursor_idle_label">静止后自动变淡</string>
+    <string name="cursor_idle_value">%1$d 秒</string>
+    <string name="cursor_idle_value_default">3 秒</string>
+    <string name="cursor_color_label">光标颜色</string>
+    <string name="cursor_color_white">白色</string>
+    <string name="cursor_color_black">黑色</string>
+    <string name="cursor_color_yellow">黄色</string>
+    <string name="cursor_toast_need_overlay">请先授予悬浮窗权限</string>
+    <string name="cursor_toast_start_failed">启动光标服务失败</string>
+    <string name="cursor_toast_no_settings">无法打开悬浮窗权限设置</string>
+
     <string name="notification_channel_name">手柄鼠标服务</string>
-    <string name="notification_text">前台服务运行中</string>
+    <string name="notification_text">光标悬浮窗运行中</string>
+    <string name="notification_action_stop">停止</string>
 </resources>

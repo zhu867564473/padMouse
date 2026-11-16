@@ -1,15 +1,21 @@
 package com.fseven.padmouse
 
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.widget.Button
+import android.widget.RadioGroup
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
+import androidx.core.content.ContextCompat
 import rikka.shizuku.Shizuku
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -37,6 +43,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var gamepadAxes: TextView
     private lateinit var gamepadEvents: TextView
     private lateinit var gamepadRefreshButton: Button
+
+    // M4 光标悬浮窗
+    private lateinit var overlayStatusValue: TextView
+    private lateinit var grantOverlayButton: Button
+    private lateinit var cursorToggle: SwitchCompat
+    private lateinit var cursorSizeSeek: SeekBar
+    private lateinit var cursorSizeValue: TextView
+    private lateinit var cursorIdleSeek: SeekBar
+    private lateinit var cursorIdleValue: TextView
+    private lateinit var cursorColorGroup: RadioGroup
+
+    /** 程序化同步开关时避免触发启动/停止逻辑。 */
+    private var suppressCursorToggle = false
+
+    private val cursorPrefs by lazy {
+        getSharedPreferences(PREFS_CURSOR, Context.MODE_PRIVATE)
+    }
 
     /** binder 调用与 shell 命令放到后台线程，避免阻塞 UI。 */
     private val injectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -110,6 +133,14 @@ class MainActivity : AppCompatActivity() {
         gamepadAxes = findViewById(R.id.gamepad_axes)
         gamepadEvents = findViewById(R.id.gamepad_events)
         gamepadRefreshButton = findViewById(R.id.button_refresh_gamepad)
+        overlayStatusValue = findViewById(R.id.overlay_status_value)
+        grantOverlayButton = findViewById(R.id.button_grant_overlay)
+        cursorToggle = findViewById(R.id.switch_cursor)
+        cursorSizeSeek = findViewById(R.id.seek_cursor_size)
+        cursorSizeValue = findViewById(R.id.cursor_size_value)
+        cursorIdleSeek = findViewById(R.id.seek_cursor_idle)
+        cursorIdleValue = findViewById(R.id.cursor_idle_value)
+        cursorColorGroup = findViewById(R.id.radio_group_cursor_color)
 
         serviceManager = ShizukuServiceManager(this) { state ->
             runOnUiThread { renderUserServiceState(state) }
@@ -121,6 +152,7 @@ class MainActivity : AppCompatActivity() {
         selfTestButton.setOnClickListener { runSelfTest() }
         testTapButton.setOnClickListener { runTestTap() }
         gamepadRefreshButton.setOnClickListener { refreshGamepadInfo() }
+        setupCursorControls()
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
         renderUserServiceState(UserServiceState.CONNECTING)
@@ -131,6 +163,8 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // 从 Shizuku 应用/授权框返回后自动刷新状态。
         renderStatus()
+        updateOverlayPermissionUi()
+        syncCursorToggle()
         serviceManager.bindNow()
     }
 
@@ -310,9 +344,176 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------------------------------------------------------------- M4 光标悬浮窗
+
+    private fun setupCursorControls() {
+        grantOverlayButton.setOnClickListener { requestOverlayPermission() }
+        cursorToggle.setOnCheckedChangeListener { _, isChecked ->
+            if (!suppressCursorToggle) setCursorEnabled(isChecked)
+        }
+
+        // 大小滑杆：20-48dp
+        cursorSizeSeek.max = MouseService.MAX_SIZE_DP - MouseService.MIN_SIZE_DP
+        cursorSizeSeek.progress = savedCursorSizeDp() - MouseService.MIN_SIZE_DP
+        updateCursorSizeLabel()
+        cursorSizeSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                updateCursorSizeLabel()
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                cursorPrefs.edit().putInt(KEY_CURSOR_SIZE, selectedCursorSizeDp()).apply()
+                pushCursorAppearance()
+            }
+        })
+
+        // 自动隐藏滑杆：1-10 秒
+        cursorIdleSeek.max = MAX_IDLE_SECONDS - MIN_IDLE_SECONDS
+        cursorIdleSeek.progress = savedCursorIdleSeconds() - MIN_IDLE_SECONDS
+        updateCursorIdleLabel()
+        cursorIdleSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                updateCursorIdleLabel()
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                cursorPrefs.edit().putInt(KEY_CURSOR_IDLE_SECONDS, selectedCursorIdleSeconds()).apply()
+                pushCursorAppearance()
+            }
+        })
+
+        cursorColorGroup.check(
+            when (savedCursorColor()) {
+                MouseService.COLOR_BLACK -> R.id.radio_cursor_black
+                MouseService.COLOR_YELLOW -> R.id.radio_cursor_yellow
+                else -> R.id.radio_cursor_white
+            }
+        )
+        cursorColorGroup.setOnCheckedChangeListener { _, checkedId ->
+            cursorPrefs.edit().putInt(KEY_CURSOR_COLOR, colorForRadio(checkedId)).apply()
+            pushCursorAppearance()
+        }
+    }
+
+    private fun updateOverlayPermissionUi() {
+        val granted = Settings.canDrawOverlays(this)
+        overlayStatusValue.setText(
+            if (granted) R.string.cursor_overlay_granted else R.string.cursor_overlay_denied
+        )
+        overlayStatusValue.setTextColor(
+            getColor(if (granted) android.R.color.holo_green_dark else android.R.color.holo_red_dark)
+        )
+        grantOverlayButton.visibility = if (granted) View.GONE else View.VISIBLE
+    }
+
+    private fun requestOverlayPermission() {
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.cursor_toast_no_settings, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun setCursorEnabled(enabled: Boolean) {
+        if (!enabled) {
+            stopService(Intent(this, MouseService::class.java))
+            return
+        }
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, R.string.cursor_toast_need_overlay, Toast.LENGTH_SHORT).show()
+            syncCursorToggle()
+            requestOverlayPermission()
+            return
+        }
+        startCursorService()
+    }
+
+    private fun startCursorService() {
+        val intent = Intent(this, MouseService::class.java)
+            .setAction(MouseService.ACTION_START)
+            .putExtra(MouseService.EXTRA_SIZE_DP, selectedCursorSizeDp())
+            .putExtra(MouseService.EXTRA_COLOR, savedCursorColor())
+            .putExtra(MouseService.EXTRA_IDLE_TIMEOUT_MS, selectedCursorIdleSeconds() * 1000L)
+        try {
+            ContextCompat.startForegroundService(this, intent)
+        } catch (t: Throwable) {
+            Toast.makeText(this, R.string.cursor_toast_start_failed, Toast.LENGTH_SHORT).show()
+            syncCursorToggle()
+        }
+    }
+
+    /** 服务已在运行时，把最新的外观设置推给服务，不需要重启。 */
+    private fun pushCursorAppearance() {
+        if (!MouseService.isRunning) return
+        val intent = Intent(this, MouseService::class.java)
+            .setAction(MouseService.ACTION_UPDATE)
+            .putExtra(MouseService.EXTRA_SIZE_DP, selectedCursorSizeDp())
+            .putExtra(MouseService.EXTRA_COLOR, savedCursorColor())
+            .putExtra(MouseService.EXTRA_IDLE_TIMEOUT_MS, selectedCursorIdleSeconds() * 1000L)
+        try {
+            startService(intent)
+        } catch (_: Throwable) {
+            // 服务可能刚好停止，外观设置已持久化，下次启动会生效。
+        }
+    }
+
+    private fun syncCursorToggle() {
+        suppressCursorToggle = true
+        cursorToggle.isChecked = MouseService.isRunning
+        suppressCursorToggle = false
+    }
+
+    private fun updateCursorSizeLabel() {
+        cursorSizeValue.text = getString(R.string.cursor_size_value, selectedCursorSizeDp())
+    }
+
+    private fun updateCursorIdleLabel() {
+        cursorIdleValue.text = getString(R.string.cursor_idle_value, selectedCursorIdleSeconds())
+    }
+
+    private fun selectedCursorSizeDp(): Int =
+        cursorSizeSeek.progress + MouseService.MIN_SIZE_DP
+
+    private fun selectedCursorIdleSeconds(): Int =
+        cursorIdleSeek.progress + MIN_IDLE_SECONDS
+
+    private fun savedCursorSizeDp(): Int = cursorPrefs
+        .getInt(KEY_CURSOR_SIZE, MouseService.DEFAULT_SIZE_DP)
+        .coerceIn(MouseService.MIN_SIZE_DP, MouseService.MAX_SIZE_DP)
+
+    private fun savedCursorColor(): Int = cursorPrefs
+        .getInt(KEY_CURSOR_COLOR, MouseService.COLOR_WHITE)
+
+    private fun savedCursorIdleSeconds(): Int = cursorPrefs
+        .getInt(KEY_CURSOR_IDLE_SECONDS, DEFAULT_IDLE_SECONDS)
+        .coerceIn(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS)
+
+    private fun colorForRadio(checkedId: Int): Int = when (checkedId) {
+        R.id.radio_cursor_black -> MouseService.COLOR_BLACK
+        R.id.radio_cursor_yellow -> MouseService.COLOR_YELLOW
+        else -> MouseService.COLOR_WHITE
+    }
+
     companion object {
         private const val GAMEPAD_EVENT_LIMIT = 10
         private const val AXIS_RENDER_INTERVAL_MS = 50L
+
+        private const val PREFS_CURSOR = "cursor_settings"
+        private const val KEY_CURSOR_SIZE = "cursor_size_dp"
+        private const val KEY_CURSOR_COLOR = "cursor_color"
+        private const val KEY_CURSOR_IDLE_SECONDS = "cursor_idle_seconds"
+        private const val MIN_IDLE_SECONDS = 1
+        private const val MAX_IDLE_SECONDS = 10
+        private const val DEFAULT_IDLE_SECONDS = 3
     }
 
     private fun openShizukuInstallPage() {
