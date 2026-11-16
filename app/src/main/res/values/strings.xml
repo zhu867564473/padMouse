@@ -13,6 +13,25 @@
     <string name="onboarding_toast_open_shizuku">请打开 Shizuku 应用并启动服务</string>
 
     <!-- 一、环境状态 -->
+    <!-- M8 一键授权 -->
+    <string name="permission_action_grant_all">一键完成全部授权</string>
+    <string name="permission_action_grant_all_running">正在授权…</string>
+    <string name="permission_state_granted">已授权</string>
+    <string name="permission_state_denied">未授权</string>
+    <string name="permission_state_requesting">正在申请…</string>
+    <string name="permission_state_unsupported">不支持</string>
+    <string name="permission_state_manual">请手动授予</string>
+    <string name="permission_hint">点一次 Shizuku 弹窗的「允许」，App 会自动开启悬浮窗与通知，全程无需进入系统设置。</string>
+    <string name="permission_overlay_short">悬浮窗</string>
+    <string name="permission_notification_short">通知</string>
+    <string name="notification_permission_label">通知权限</string>
+    <string name="permission_action_open_notification_settings">打开通知设置</string>
+    <string name="permission_notice_need_shizuku">需要先完成 Shizuku 授权，请按提示安装/启动并允许本应用。自动授权失败时仍可手动跳转系统设置。</string>
+    <string name="permission_notice_waiting_shizuku">请在 Shizuku 弹窗中点「允许」，其余权限会自动开启。</string>
+    <string name="permission_notice_auto_granted">已通过 Shizuku 自动开启：%1$s</string>
+    <string name="permission_notice_manual_required">自动开启失败，请点对应按钮手动授予（仍可继续使用手动入口）。</string>
+    <string name="permission_self_heal_notice">检测到权限被回收，已通过 Shizuku 自动补开</string>
+
     <string name="env_card_title">环境状态</string>
     <string name="shizuku_status_label">Shizuku 状态</string>
     <string name="shizuku_status_not_installed">未安装</string>

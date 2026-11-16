@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.View
@@ -59,6 +60,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var installButton: Button
     private lateinit var overlayStatusValue: TextView
     private lateinit var grantOverlayButton: Button
+
+    // M8 一键授权：悬浮窗 / 通知状态行与兜底入口
+    private lateinit var grantAllButton: Button
+    private lateinit var permissionNotice: TextView
+    private lateinit var notificationStatusValue: TextView
+    private lateinit var notificationSettingsButton: Button
+    private var overlayRequesting = false
+    private var notificationRequesting = false
+    private var overlayManualFallback = false
+    private var notificationManualFallback = false
+    private var autoGrantRunning = false
+    private var autoGrantStartedByOneTap = false
+
     private lateinit var injectServiceStatus: TextView
     private lateinit var selfTestButton: Button
     private lateinit var testTapButton: Button
@@ -267,7 +281,12 @@ class MainActivity : AppCompatActivity() {
                 if (granted) {
                     renderUserServiceState(UserServiceState.CONNECTING)
                     serviceManager.bindNow()
+                    // Shizuku 授权后置动作：依次代开悬浮窗与通知，全程不进系统设置。
+                    beginAutoGrant(fromOneTap = autoGrantStartedByOneTap)
+                } else {
+                    abortAutoGrant()
                 }
+                updatePermissionStatusUi()
             }
         }
 
@@ -286,6 +305,10 @@ class MainActivity : AppCompatActivity() {
         installButton = findViewById(R.id.button_install_shizuku)
         overlayStatusValue = findViewById(R.id.overlay_status_value)
         grantOverlayButton = findViewById(R.id.button_grant_overlay)
+        grantAllButton = findViewById(R.id.button_grant_all)
+        permissionNotice = findViewById(R.id.permission_notice)
+        notificationStatusValue = findViewById(R.id.notification_status_value)
+        notificationSettingsButton = findViewById(R.id.button_notification_settings)
         injectServiceStatus = findViewById(R.id.inject_service_status)
         selfTestButton = findViewById(R.id.button_self_test)
         testTapButton = findViewById(R.id.button_test_tap)
@@ -333,6 +356,8 @@ class MainActivity : AppCompatActivity() {
         requestButton.setOnClickListener { requestShizukuPermission() }
         installButton.setOnClickListener { openShizukuInstallPage() }
         grantOverlayButton.setOnClickListener { requestOverlayPermission() }
+        grantAllButton.setOnClickListener { runOneTapGrant() }
+        notificationSettingsButton.setOnClickListener { openNotificationSettings() }
         selfTestButton.setOnClickListener { runSelfTest() }
         testTapButton.setOnClickListener { runTestTap() }
         gamepadRefreshButton.setOnClickListener { refreshGamepadInfo() }
@@ -351,12 +376,22 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // 从 Shizuku/悬浮窗设置页返回后自动刷新状态。
         renderStatus()
-        updateOverlayPermissionUi()
+        updatePermissionStatusUi()
         renderRunState()
         stopCursorIfOverlayRevoked()
         serviceManager.bindNow()
         syncMapper()
         renderOnboarding()
+        // MouseService 启动时自检补开的界面提示（不弹 Toast 打扰）。
+        val persistedNotice = MouseService.takePermissionNotice()
+        if (persistedNotice != null) {
+            showPermissionNotice(persistedNotice)
+        } else if (!autoGrantRunning && allPermissionsGranted()) {
+            // 权限已通过手动入口补齐时，清掉上一轮的失败提示。
+            permissionNotice.visibility = View.GONE
+        }
+        // 权限自愈：悬浮窗/通知被回收且 Shizuku 仍可用时自动补开。
+        selfHealPermissions()
         runStatusValue.removeCallbacks(runStatePoller)
         runStatusValue.postDelayed(runStatePoller, RUN_STATE_POLL_MS)
     }
@@ -376,6 +411,7 @@ class MainActivity : AppCompatActivity() {
         if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
             Toast.makeText(this, R.string.cursor_toast_notification_denied, Toast.LENGTH_LONG).show()
         }
+        updatePermissionStatusUi()
     }
 
     override fun onDestroy() {
@@ -644,7 +680,7 @@ class MainActivity : AppCompatActivity() {
         if (!MouseService.isRunning) return
         if (Settings.canDrawOverlays(this)) return
         stopCursorService(showToast = true)
-        updateOverlayPermissionUi()
+        updatePermissionStatusUi()
     }
 
     /** 运行状态变化时同步大按钮文案，并在服务被外部停止时停掉映射。 */
@@ -679,15 +715,245 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun updateOverlayPermissionUi() {
-        val granted = Settings.canDrawOverlays(this)
+    /**
+     * 统一刷新权限状态区：每一行都以系统 API 复核结果为准。
+     * 只有确实不可用的权限才显示「请手动授予」，并保留手动跳转按钮。
+     */
+    private fun updatePermissionStatusUi() {
+        if (!::overlayStatusValue.isInitialized) return
+
+        val overlayGranted = Settings.canDrawOverlays(this)
+        if (overlayGranted) overlayManualFallback = false
         overlayStatusValue.setText(
-            if (granted) R.string.cursor_overlay_granted else R.string.cursor_overlay_denied
+            when {
+                overlayGranted -> R.string.permission_state_granted
+                overlayRequesting -> R.string.permission_state_requesting
+                overlayManualFallback -> R.string.permission_state_manual
+                else -> R.string.permission_state_denied
+            }
         )
         overlayStatusValue.setTextColor(
-            getColor(if (granted) android.R.color.holo_green_dark else android.R.color.holo_red_dark)
+            getColor(if (overlayGranted) android.R.color.holo_green_dark else android.R.color.holo_red_dark)
         )
-        grantOverlayButton.visibility = if (granted) View.GONE else View.VISIBLE
+        grantOverlayButton.visibility = if (overlayGranted) View.GONE else View.VISIBLE
+
+        val supported = shizukuManager.supportsNotificationPermission()
+        val notificationGranted = shizukuManager.hasNotificationPermission()
+        if (notificationGranted) notificationManualFallback = false
+        notificationStatusValue.setText(
+            when {
+                !supported -> R.string.permission_state_unsupported
+                notificationGranted -> R.string.permission_state_granted
+                notificationRequesting -> R.string.permission_state_requesting
+                notificationManualFallback -> R.string.permission_state_manual
+                else -> R.string.permission_state_denied
+            }
+        )
+        notificationStatusValue.setTextColor(
+            getColor(
+                if (notificationGranted || !supported) android.R.color.holo_green_dark
+                else android.R.color.holo_red_dark
+            )
+        )
+        // 兜底入口：命令失败或复核失败时始终保留手动跳转。
+        notificationSettingsButton.visibility =
+            if (notificationGranted || !supported) View.GONE else View.VISIBLE
+    }
+
+    private fun showPermissionNotice(message: String) {
+        permissionNotice.text = message
+        permissionNotice.visibility = View.VISIBLE
+    }
+
+    /** 一键授权：Shizuku 授权 → 悬浮窗 → 通知，全程不跳系统设置。 */
+    private fun runOneTapGrant() {
+        if (autoGrantRunning) return
+        when (shizukuManager.getStatus()) {
+            ShizukuStatus.NOT_INSTALLED -> {
+                showPermissionNotice(getString(R.string.permission_notice_need_shizuku))
+                openShizukuInstallPage()
+            }
+
+            ShizukuStatus.NOT_RUNNING -> {
+                showPermissionNotice(getString(R.string.permission_notice_need_shizuku))
+                openShizukuApp()
+            }
+
+            ShizukuStatus.NOT_GRANTED -> {
+                showPermissionNotice(getString(R.string.permission_notice_waiting_shizuku))
+                if (!shizukuManager.requestPermission(ShizukuManager.REQUEST_CODE_PERMISSION)) {
+                    // 状态刚好变化（已授权/服务被杀），刷新而不是静默失败。
+                    renderStatus()
+                    renderOnboarding()
+                    updatePermissionStatusUi()
+                }
+            }
+
+            ShizukuStatus.GRANTED -> beginAutoGrant(fromOneTap = true)
+        }
+    }
+
+    /**
+     * 在单线程执行器上串行执行两条 shell 命令；先等 UserService 就绪，
+     * 超时则直接用 Shizuku shell 兜底，保证刚授权时也能立即一键完成。
+     */
+    private fun beginAutoGrant(fromOneTap: Boolean) {
+        if (autoGrantRunning) return
+        if (shizukuManager.getStatus() != ShizukuStatus.GRANTED) return
+        autoGrantRunning = true
+        if (fromOneTap) {
+            autoGrantStartedByOneTap = true
+            grantAllButton.isEnabled = false
+            grantAllButton.setText(R.string.permission_action_grant_all_running)
+        }
+        injectExecutor.execute {
+            awaitUserService(USER_SERVICE_WAIT_MS)
+            val results = shizukuManager.autoGrantPermissions(
+                shell = { command -> execGrantShell(command) },
+                onStep = { step, status, _ ->
+                    runOnUiThread {
+                        if (!isFinishing && !isDestroyed) renderGrantStep(step, status)
+                    }
+                },
+            )
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                applyGrantResults(results)
+                completeAutoGrant()
+            }
+        }
+    }
+
+    /** 等待 UserService 绑定；期间周期性重试绑定，避免刚授权时拿不到 shell。 */
+    private fun awaitUserService(timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        var lastBindAt = 0L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (serviceManager.isReady) return true
+            if (SystemClock.elapsedRealtime() - lastBindAt > USER_SERVICE_REBIND_MS) {
+                lastBindAt = SystemClock.elapsedRealtime()
+                serviceManager.bindNow()
+            }
+            try {
+                Thread.sleep(USER_SERVICE_POLL_MS)
+            } catch (_: InterruptedException) {
+                return serviceManager.isReady
+            }
+        }
+        return serviceManager.isReady
+    }
+
+    /** 统一走已有的 IPadMouse.shellExec（UserService 未就绪时命令会失败并走手动兜底）。 */
+    private fun execGrantShell(command: String): String = serviceManager.shellExec(command)
+
+    private fun renderGrantStep(step: AutoGrantStep, status: AutoGrantStatus) {
+        when (step) {
+            AutoGrantStep.OVERLAY -> {
+                overlayRequesting = status == AutoGrantStatus.REQUESTING
+                if (status == AutoGrantStatus.FAILED) overlayManualFallback = true
+            }
+
+            AutoGrantStep.NOTIFICATION -> {
+                notificationRequesting = status == AutoGrantStatus.REQUESTING
+                if (status == AutoGrantStatus.FAILED) notificationManualFallback = true
+            }
+        }
+        updatePermissionStatusUi()
+    }
+
+    private fun applyGrantResults(results: List<AutoGrantResult>) {
+        for (result in results) {
+            when (result.step) {
+                AutoGrantStep.OVERLAY -> {
+                    overlayRequesting = false
+                    overlayManualFallback = result.status == AutoGrantStatus.FAILED
+                }
+
+                AutoGrantStep.NOTIFICATION -> {
+                    notificationRequesting = false
+                    notificationManualFallback = result.status == AutoGrantStatus.FAILED
+                }
+            }
+        }
+        val changedLabels = results
+            .filter { it.changed && it.status == AutoGrantStatus.GRANTED }
+            .map {
+                getString(
+                    if (it.step == AutoGrantStep.OVERLAY) R.string.permission_overlay_short
+                    else R.string.permission_notification_short
+                )
+            }
+        val failed = results.any { it.status == AutoGrantStatus.FAILED }
+        when {
+            failed -> showPermissionNotice(getString(R.string.permission_notice_manual_required))
+            changedLabels.isNotEmpty() -> showPermissionNotice(
+                getString(R.string.permission_notice_auto_granted, changedLabels.joinToString("、"))
+            )
+
+            else -> permissionNotice.visibility = View.GONE
+        }
+    }
+
+    private fun completeAutoGrant() {
+        val wasOneTap = autoGrantStartedByOneTap
+        autoGrantRunning = false
+        autoGrantStartedByOneTap = false
+        if (wasOneTap) {
+            grantAllButton.isEnabled = true
+            grantAllButton.setText(R.string.permission_action_grant_all)
+        }
+        updatePermissionStatusUi()
+        renderOnboarding()
+        syncMapper()
+    }
+
+    /** 一键流程中用户拒绝/取消 Shizuku 授权时复位按钮。 */
+    private fun abortAutoGrant() {
+        if (!autoGrantStartedByOneTap) return
+        autoGrantRunning = false
+        autoGrantStartedByOneTap = false
+        grantAllButton.isEnabled = true
+        grantAllButton.setText(R.string.permission_action_grant_all)
+        updatePermissionStatusUi()
+    }
+
+    /**
+     * 权限自愈：回到前台时若悬浮窗/通知被系统回收且 Shizuku 仍可用，自动补开。
+     * 补开结果只写界面提示，不弹 Toast。
+     */
+    private fun allPermissionsGranted(): Boolean =
+        Settings.canDrawOverlays(this) &&
+            (!shizukuManager.supportsNotificationPermission() ||
+                shizukuManager.hasNotificationPermission())
+
+    private fun selfHealPermissions() {
+        if (autoGrantRunning) return
+        if (shizukuManager.getStatus() != ShizukuStatus.GRANTED) return
+        val needsOverlay = !Settings.canDrawOverlays(this)
+        val needsNotification = shizukuManager.supportsNotificationPermission() &&
+            !shizukuManager.hasNotificationPermission()
+        if (!needsOverlay && !needsNotification) return
+        beginAutoGrant(fromOneTap = false)
+    }
+
+    private fun openNotificationSettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            )
+        } catch (e: ActivityNotFoundException) {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (e2: ActivityNotFoundException) {
+                Toast.makeText(this, R.string.cursor_toast_no_settings, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun requestOverlayPermission() {
@@ -1188,6 +1454,9 @@ class MainActivity : AppCompatActivity() {
         private const val REBIND_DELAY_MS = 1000L
         private const val MAX_REBIND_ATTEMPTS = 5
         private const val REQUEST_NOTIFICATIONS = 1001
+        private const val USER_SERVICE_WAIT_MS = 4000L
+        private const val USER_SERVICE_POLL_MS = 100L
+        private const val USER_SERVICE_REBIND_MS = 800L
     }
 }
 

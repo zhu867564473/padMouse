@@ -56,6 +56,9 @@ class MouseService : Service() {
     /** 窗口是否已经成功 addView，避免重复 remove。 */
     private var overlayAdded = false
 
+    /** 服务每次启动只做一次权限自检。 */
+    private var permissionSelfCheckStarted = false
+
     /** 窗口级透明度动画；同时决定输入使用的 opacity。 */
     private var windowAlphaAnimator: ValueAnimator? = null
 
@@ -102,6 +105,7 @@ class MouseService : Service() {
         }
 
         ensureForeground()
+        runPermissionSelfCheck()
 
         val sizeDp = intent?.getIntExtra(EXTRA_SIZE_DP, cursorSizeDp) ?: cursorSizeDp
         val color = intent?.getIntExtra(EXTRA_COLOR, cursorColor) ?: cursorColor
@@ -344,6 +348,38 @@ class MouseService : Service() {
         handler.postDelayed(permissionWatchdog, PERMISSION_CHECK_INTERVAL_MS)
     }
 
+    // ---------------------------------------------------------------- 权限自检
+
+    /**
+     * 服务启动时的一次性权限自检：悬浮窗/通知被系统回收且 Shizuku 仍可用时自动补开。
+     *
+     * 悬浮窗缺失时 [showCursor] 会自行停服；这里主要补开通知权限，
+     * 并把结果写成界面提示交给 MainActivity（不弹 Toast 打扰）。
+     */
+    private fun runPermissionSelfCheck() {
+        if (permissionSelfCheckStarted) return
+        permissionSelfCheckStarted = true
+        Thread({
+            try {
+                val shizuku = ShizukuManager(this)
+                if (shizuku.getStatus() != ShizukuStatus.GRANTED) return@Thread
+                val needsOverlay = !shizuku.canDrawOverlays()
+                val needsNotification = shizuku.supportsNotificationPermission() &&
+                    !shizuku.hasNotificationPermission()
+                if (!needsOverlay && !needsNotification) return@Thread
+
+                val results = shizuku.autoGrantPermissions(shell = { command ->
+                    shizuku.shell(command)
+                })
+                if (results.any { it.changed && it.status == AutoGrantStatus.GRANTED }) {
+                    lastPermissionNotice = getString(R.string.permission_self_heal_notice)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "权限自检失败", t)
+            }
+        }, "permission-self-check").start()
+    }
+
     // ---------------------------------------------------------------- 前台服务
 
     private fun ensureForeground() {
@@ -457,5 +493,15 @@ class MouseService : Service() {
 
         /** 供映射引擎（M5）读取当前光标坐标。 */
         fun currentPosition(): FloatArray? = instance?.currentPosition()
+
+        /** 服务启动自检补开权限后的界面提示；MainActivity 读取后清空，避免重复展示。 */
+        @Volatile
+        private var lastPermissionNotice: String? = null
+
+        fun takePermissionNotice(): String? {
+            val notice = lastPermissionNotice
+            lastPermissionNotice = null
+            return notice
+        }
     }
 }
