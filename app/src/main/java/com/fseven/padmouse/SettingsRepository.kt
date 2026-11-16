@@ -3,15 +3,90 @@ package com.fseven.padmouse
 import android.content.Context
 
 /**
- * M6 设置持久化：系统动作绑定写入 SharedPreferences。
+ * M7 设置持久化：光标外观、手感参数、按键绑定统一写入 SharedPreferences。
  *
- * 只保存与默认值不同的绑定；读取时缺失或格式错误的项回落到
- * [DefaultBindings.SYSTEM_ACTIONS]，避免升级后出现空绑定。
+ * 所有读取都带默认值与范围钳制，旧版本数据损坏或缺失时不会出现空配置；
+ * 首次升级会从 M4 的 `cursor_settings` 迁移光标外观，用户旧设置不丢。
  */
 class SettingsRepository(context: Context) {
 
-    private val prefs = context.applicationContext
-        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val appContext: Context = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    init {
+        migrateLegacyCursorPrefs()
+    }
+
+    // ---------------------------------------------------------------- 光标外观
+
+    fun loadCursorSizeDp(): Int = prefs.getInt(KEY_CURSOR_SIZE, MouseService.DEFAULT_SIZE_DP)
+        .coerceIn(MouseService.MIN_SIZE_DP, MouseService.MAX_SIZE_DP)
+
+    fun saveCursorSizeDp(sizeDp: Int) {
+        prefs.edit()
+            .putInt(KEY_CURSOR_SIZE, sizeDp.coerceIn(MouseService.MIN_SIZE_DP, MouseService.MAX_SIZE_DP))
+            .apply()
+    }
+
+    fun loadCursorColor(): Int = prefs.getInt(KEY_CURSOR_COLOR, MouseService.COLOR_WHITE)
+
+    fun saveCursorColor(color: Int) {
+        prefs.edit().putInt(KEY_CURSOR_COLOR, color).apply()
+    }
+
+    fun loadCursorIdleSeconds(): Int =
+        prefs.getInt(KEY_CURSOR_IDLE_SECONDS, DEFAULT_IDLE_SECONDS)
+            .coerceIn(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS)
+
+    fun saveCursorIdleSeconds(seconds: Int) {
+        prefs.edit()
+            .putInt(KEY_CURSOR_IDLE_SECONDS, seconds.coerceIn(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS))
+            .apply()
+    }
+
+    // ---------------------------------------------------------------- 手感参数
+
+    fun loadDeadzone(): Float = prefs.getFloat(KEY_DEADZONE, DefaultBindings.DEADZONE)
+        .coerceIn(MIN_DEADZONE, MAX_DEADZONE)
+
+    fun saveDeadzone(value: Float) {
+        prefs.edit().putFloat(KEY_DEADZONE, value.coerceIn(MIN_DEADZONE, MAX_DEADZONE)).apply()
+    }
+
+    fun loadSpeedPxPerSec(): Float =
+        prefs.getFloat(KEY_SPEED_PX_PER_SEC, DefaultBindings.SPEED_PX_PER_SEC)
+            .coerceIn(MIN_SPEED_PX_PER_SEC, MAX_SPEED_PX_PER_SEC)
+
+    fun saveSpeedPxPerSec(value: Float) {
+        prefs.edit()
+            .putFloat(KEY_SPEED_PX_PER_SEC, value.coerceIn(MIN_SPEED_PX_PER_SEC, MAX_SPEED_PX_PER_SEC))
+            .apply()
+    }
+
+    fun loadAccelExponent(): Float =
+        prefs.getFloat(KEY_ACCEL_EXPONENT, DefaultBindings.ACCEL_EXPONENT)
+            .coerceIn(MIN_ACCEL_EXPONENT, MAX_ACCEL_EXPONENT)
+
+    fun saveAccelExponent(value: Float) {
+        prefs.edit()
+            .putFloat(KEY_ACCEL_EXPONENT, value.coerceIn(MIN_ACCEL_EXPONENT, MAX_ACCEL_EXPONENT))
+            .apply()
+    }
+
+    /**
+     * 组装 Mapper 配置：手感参数来自持久化，按键绑定由调用方传入
+     * （系统动作绑定也一并持久化在同一个文件里）。
+     */
+    fun loadMapperConfig(
+        systemBindings: Map<SystemAction, ActionBinding>
+    ): MapperConfig = MapperConfig(
+        deadzone = loadDeadzone(),
+        speedPxPerSec = loadSpeedPxPerSec(),
+        exponent = loadAccelExponent(),
+        systemBindings = systemBindings,
+    )
+
+    // ---------------------------------------------------------------- 按键绑定
 
     /** 按 [SystemAction] 枚举顺序返回当前绑定（含默认值补齐）。 */
     fun loadSystemBindings(): Map<SystemAction, ActionBinding> {
@@ -36,7 +111,61 @@ class SettingsRepository(context: Context) {
 
     private fun keyOf(action: SystemAction): String = "system_action_${action.name.lowercase()}"
 
+    /**
+     * M4 使用独立的 `cursor_settings` 文件；升级到 M7 后统一到本仓库。
+     * 只在目标键缺失时迁移，避免覆盖用户在新版本里改过的值。
+     */
+    private fun migrateLegacyCursorPrefs() {
+        val legacy = runCatching {
+            appContext.getSharedPreferences(LEGACY_CURSOR_PREFS, Context.MODE_PRIVATE)
+        }.getOrNull() ?: return
+        if (!legacy.contains(KEY_CURSOR_SIZE) &&
+            !legacy.contains(KEY_CURSOR_COLOR) &&
+            !legacy.contains(KEY_CURSOR_IDLE_SECONDS)
+        ) {
+            return
+        }
+        val editor = prefs.edit()
+        if (!prefs.contains(KEY_CURSOR_SIZE) && legacy.contains(KEY_CURSOR_SIZE)) {
+            editor.putInt(KEY_CURSOR_SIZE, legacy.getInt(KEY_CURSOR_SIZE, MouseService.DEFAULT_SIZE_DP))
+        }
+        if (!prefs.contains(KEY_CURSOR_COLOR) && legacy.contains(KEY_CURSOR_COLOR)) {
+            editor.putInt(KEY_CURSOR_COLOR, legacy.getInt(KEY_CURSOR_COLOR, MouseService.COLOR_WHITE))
+        }
+        if (!prefs.contains(KEY_CURSOR_IDLE_SECONDS) && legacy.contains(KEY_CURSOR_IDLE_SECONDS)) {
+            editor.putInt(
+                KEY_CURSOR_IDLE_SECONDS,
+                legacy.getInt(KEY_CURSOR_IDLE_SECONDS, DEFAULT_IDLE_SECONDS)
+            )
+        }
+        editor.apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "padmouse_settings"
+        private const val LEGACY_CURSOR_PREFS = "cursor_settings"
+
+        private const val KEY_CURSOR_SIZE = "cursor_size_dp"
+        private const val KEY_CURSOR_COLOR = "cursor_color"
+        private const val KEY_CURSOR_IDLE_SECONDS = "cursor_idle_seconds"
+        private const val KEY_DEADZONE = "feel_deadzone"
+        private const val KEY_SPEED_PX_PER_SEC = "feel_speed_px_per_sec"
+        private const val KEY_ACCEL_EXPONENT = "feel_accel_exponent"
+
+        const val MIN_IDLE_SECONDS = 1
+        const val MAX_IDLE_SECONDS = 10
+        const val DEFAULT_IDLE_SECONDS = 3
+
+        const val MIN_SPEED_PX_PER_SEC = 200f
+        const val MAX_SPEED_PX_PER_SEC = 2000f
+        const val SPEED_STEP = 50f
+
+        const val MIN_DEADZONE = 0.02f
+        const val MAX_DEADZONE = 0.40f
+        const val DEADZONE_STEP = 0.01f
+
+        const val MIN_ACCEL_EXPONENT = 1.0f
+        const val MAX_ACCEL_EXPONENT = 3.0f
+        const val EXPONENT_STEP = 0.1f
     }
 }

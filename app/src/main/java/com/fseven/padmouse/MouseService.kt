@@ -20,6 +20,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.ServiceCompat
 import kotlin.math.abs
 import kotlin.math.max
@@ -61,6 +62,25 @@ class MouseService : Service() {
     private val idleHideRunnable = Runnable {
         // 静止超时：降低窗口 alpha（不是 View alpha），保留一个可感知的落点。
         animateWindowAlpha(IDLE_WINDOW_ALPHA, FADE_OUT_MS)
+    }
+
+    /**
+     * 悬浮窗权限被撤销时立即停止服务并提示，避免留下没有光标的空服务。
+     * 系统设置页撤销权限不会通知 App，只能轮询。
+     */
+    private val permissionWatchdog = object : Runnable {
+        override fun run() {
+            if (!Settings.canDrawOverlays(this@MouseService)) {
+                Toast.makeText(
+                    this@MouseService,
+                    R.string.cursor_toast_overlay_revoked,
+                    Toast.LENGTH_LONG
+                ).show()
+                stopSelfSafely()
+                return
+            }
+            handler.postDelayed(this, PERMISSION_CHECK_INTERVAL_MS)
+        }
     }
 
     inner class LocalBinder : Binder() {
@@ -128,6 +148,7 @@ class MouseService : Service() {
             applyAppearance(existing)
             clampAndApplyPosition()
             showCursorNow()
+            schedulePermissionWatchdog()
             return
         }
 
@@ -170,6 +191,7 @@ class MouseService : Service() {
         overlayAdded = true
         isRunning = true
         scheduleIdleHide()
+        schedulePermissionWatchdog()
     }
 
     private fun applyAppearance(view: CursorView) {
@@ -221,6 +243,7 @@ class MouseService : Service() {
 
     private fun removeOverlay() {
         handler.removeCallbacks(idleHideRunnable)
+        handler.removeCallbacks(permissionWatchdog)
         windowAlphaAnimator?.cancel()
         windowAlphaAnimator = null
         val view = cursorView
@@ -316,6 +339,11 @@ class MouseService : Service() {
         }
     }
 
+    private fun schedulePermissionWatchdog() {
+        handler.removeCallbacks(permissionWatchdog)
+        handler.postDelayed(permissionWatchdog, PERMISSION_CHECK_INTERVAL_MS)
+    }
+
     // ---------------------------------------------------------------- 前台服务
 
     private fun ensureForeground() {
@@ -408,6 +436,7 @@ class MouseService : Service() {
         private const val IDLE_WINDOW_ALPHA = 0.15f
         private const val FADE_IN_MS = 120L
         private const val FADE_OUT_MS = 200L
+        private const val PERMISSION_CHECK_INTERVAL_MS = 2000L
 
         /** 服务/光标是否在运行，供主界面同步开关状态。 */
         @Volatile
