@@ -21,7 +21,7 @@ object DefaultBindings {
     const val LONG_PRESS_MS = 350L
 
     /** 扳机按下阈值（归一化后）。 */
-    const val TRIGGER_THRESHOLD = 0.5f
+    const val TRIGGER_THRESHOLD = 0.85f
 
     /** 扳机释放阈值 = 按下阈值 * 该比例（滞回）。 */
     const val TRIGGER_RELEASE_RATIO = 0.7f

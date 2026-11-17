@@ -227,6 +227,7 @@ class MouseService : Service() {
     private val mapperListener = object : Mapper.Listener {
         override fun onCursor(x: Float, y: Float) {
             MouseRuntime.setCursor(x, y)
+            syncOverlayForForeground()
         }
 
         override fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {
@@ -247,23 +248,42 @@ class MouseService : Service() {
 
     /** 注入实现；所有调用串行化，避免手势事件乱序。 */
     private val mapperInjector = object : Mapper.Injector {
-        override fun tap(x: Float, y: Float) = dispatchInjection { serviceManager.tap(x, y) }
+        override fun tap(x: Float, y: Float) = dispatchInjection {
+            Log.d(TAG, "INJECT tap($x,$y)")
+            serviceManager.tap(x, y)
+        }
 
-        override fun rightClick(x: Float, y: Float) = dispatchInjection { serviceManager.rightClick(x, y) }
+        override fun rightClick(x: Float, y: Float) = dispatchInjection {
+            Log.d(TAG, "INJECT rightClick($x,$y)")
+            serviceManager.rightClick(x, y)
+        }
 
-        override fun middleClick(x: Float, y: Float) = dispatchInjection { serviceManager.middleClick(x, y) }
+        override fun middleClick(x: Float, y: Float) = dispatchInjection {
+            Log.d(TAG, "INJECT middleClick($x,$y)")
+            serviceManager.middleClick(x, y)
+        }
 
-        override fun touchDown(x: Float, y: Float) = dispatchInjection { serviceManager.down(x, y) }
+        override fun touchDown(x: Float, y: Float) = dispatchInjection {
+            Log.d(TAG, "INJECT touchDown($x,$y)")
+            serviceManager.down(x, y)
+        }
 
         override fun touchMove(x: Float, y: Float) = dispatchInjection { serviceManager.move(x, y) }
 
-        override fun touchUp(x: Float, y: Float) = dispatchInjection { serviceManager.up(x, y) }
+        override fun touchUp(x: Float, y: Float) = dispatchInjection {
+            Log.d(TAG, "INJECT touchUp($x,$y)")
+            serviceManager.up(x, y)
+        }
 
-        override fun mouseDown(x: Float, y: Float, button: Int) =
-            dispatchInjection { serviceManager.mouseDown(x, y, button) }
+        override fun mouseDown(x: Float, y: Float, button: Int) = dispatchInjection {
+            Log.d(TAG, "INJECT mouseDown($x,$y,btn=$button)")
+            serviceManager.mouseDown(x, y, button)
+        }
 
-        override fun mouseUp(x: Float, y: Float, button: Int) =
-            dispatchInjection { serviceManager.mouseUp(x, y, button) }
+        override fun mouseUp(x: Float, y: Float, button: Int) = dispatchInjection {
+            Log.d(TAG, "INJECT mouseUp($x,$y,btn=$button)")
+            serviceManager.mouseUp(x, y, button)
+        }
 
         override fun mouseMove(x: Float, y: Float, buttonState: Int) =
             dispatchInjection { serviceManager.mouseMove(x, y, buttonState) }
@@ -699,9 +719,11 @@ class MouseService : Service() {
 
     private fun createUhidDevice(): String {
         val binder = uhidBinder() ?: return "ERROR: UserService 未连接"
-        return runCatching { binder.createUhidMouse() }.getOrElse { t ->
-            "ERROR: ${t.javaClass.simpleName}: ${t.message}"
-        }
+        // AIDL 返回值是平台类型（String!），实际可能为 null；必须显式兜底，
+        // 否则后续 status.startsWith("ERROR") 会抛 NPE 让整个服务启动崩溃。
+        val status = runCatching { binder.createUhidMouse() }.getOrNull()
+        if (status.isNullOrBlank()) return "ERROR: UHID 创建未返回状态（UserService 未就绪）"
+        return status
     }
 
     private fun destroyUhidDevice() {
@@ -727,23 +749,35 @@ class MouseService : Service() {
         appliedInputMode = mode
 
         if (mode == InputMode.UHID) {
-            val status = createUhidDevice()
-            if (!status.startsWith("ERROR")) {
+            // 不要用 create() 的返回值判定成败：AIDL 返回值是平台类型，
+            // UserService 侧可能已成功创建但返回空串，会导致「设备存在却判定失败」，
+            // 于是触摸注入继续跑、自绘光标不隐藏，出现两个输入源打架（乱点击 + 滚轮失效）。
+            // 一律以 UserService 里的实际设备状态为准。
+            val created = createUhidDevice()
+            val actual = runCatching { uhidBinder()?.uhidStatus() }.getOrNull().orEmpty().trim()
+            val ok = actual.startsWith("active=true")
+            Log.i(TAG, "applyInputBackend UHID: create=[$created] actual=[$actual] ok=$ok")
+            if (ok) {
                 effectiveInputMode = InputMode.UHID
                 if (::mapper.isInitialized) mapper.updateInputMode(InputMode.UHID)
                 setOverlayVisible(false)
-                MouseService.setUhidState(true, status)
-                Log.i(TAG, "UHID 虚拟鼠标就绪: $status")
+                MouseService.setUhidState(true, actual)
+                Log.i(TAG, "UHID 虚拟鼠标就绪: $actual")
             } else {
+                val reason = when {
+                    actual.isNotEmpty() -> actual
+                    created.isNotEmpty() -> created
+                    else -> "UHID 状态未知"
+                }
                 effectiveInputMode = InputMode.TOUCH
                 if (::mapper.isInitialized) mapper.updateInputMode(InputMode.TOUCH)
                 setOverlayVisible(true)
-                MouseService.setUhidState(false, status)
+                MouseService.setUhidState(false, reason)
                 MouseRuntime.setStage(
                     RunStage.RUNNING,
-                    getString(R.string.run_detail_uhid_fallback, status)
+                    getString(R.string.run_detail_uhid_fallback, reason)
                 )
-                Log.w(TAG, "UHID 创建失败，回退触摸注入: $status")
+                Log.w(TAG, "UHID 创建失败，回退触摸注入: $reason")
             }
         } else {
             destroyUhidDevice()
@@ -805,7 +839,12 @@ class MouseService : Service() {
         cursorY = params.y.toFloat()
 
         try {
-            windowManager.addView(view, params)
+            // UHID 模式下用系统光标，自绘窗口一开始就不挂载，避免出现两个光标。
+            if (settingsRepository.loadInputMode() == InputMode.UHID) {
+                Log.d(TAG, "addOverlay：UHID 模式，跳过自绘光标挂载")
+            } else {
+                windowManager.addView(view, params)
+            }
         } catch (t: Throwable) {
             Log.e(TAG, "添加光标悬浮窗失败", t)
             MouseRuntime.setStage(RunStage.FAILED, getString(R.string.run_detail_overlay_missing))
@@ -815,7 +854,9 @@ class MouseService : Service() {
 
         cursorView = view
         layoutParams = params
-        overlayAdded = true
+        // 以「窗口是否真的挂上了」为准，而不是无条件 true：
+        // UHID 模式下我们跳过了 addView，标志必须同步为 false。
+        overlayAdded = view.isAttachedToWindow
         isRunning = true
         scheduleIdleHide()
         schedulePermissionWatchdog()
@@ -1039,21 +1080,54 @@ class MouseService : Service() {
     }
 
     /** 游戏模式隐藏光标：窗口 alpha 归零（保留视图），切回时原位淡入。 */
-    private fun setOverlayVisible(visible: Boolean) {
+    /** UHID 模式下系统可能不画指针，切到其它 App 时用自绘光标兜底。 */
+    private var overlayForOtherApp = false
+
+    private fun syncOverlayForForeground() {
+        // 只要不是 UHID 后端，自绘光标本来就是主光标，不需要切换。
+        if (inputMode != InputMode.UHID) return
+        val show = !MouseRuntime.appForeground
+        if (show == overlayForOtherApp) return
+        overlayForOtherApp = show
+        Log.d(
+            TAG,
+            "syncOverlay show=$show appForeground=${MouseRuntime.appForeground} " +
+                "cursorView=${cursorView != null} params=${layoutParams != null} added=$overlayAdded"
+        )
+        setOverlayVisible(show, autoHide = false)
+        Log.d(TAG, "syncOverlay done added=$overlayAdded attached=${cursorView?.isAttachedToWindow}")
+    }
+
+    private fun setOverlayVisible(visible: Boolean, autoHide: Boolean = true) {
         overlayHidden = !visible
         val params = layoutParams ?: return
         val view = cursorView ?: return
         windowAlphaAnimator?.cancel()
         windowAlphaAnimator = null
         if (visible) {
+            // UHID 模式下窗口是被真正移除的，切回触摸模式时要重新挂上。
+            if (!overlayAdded) {
+                runCatching {
+                    windowManager.addView(view, params)
+                    overlayAdded = true
+                }.onFailure { Log.w(TAG, "重新添加光标窗口失败", it) }
+            }
             params.alpha = ACTIVE_WINDOW_ALPHA
-            scheduleIdleHide()
+            // autoHide=false：切换 App 的兜底光标不能静止 3 秒就消失，
+            // 否则用户在其他 App 里会看不到指针。
+            if (autoHide) scheduleIdleHide() else handler.removeCallbacks(idleHideRunnable)
+            if (overlayAdded && view.isAttachedToWindow) {
+                runCatching { windowManager.updateViewLayout(view, params) }
+            }
         } else {
+            // 彻底移除窗口，而不是把 alpha 设为 0：
+            // alpha=0 的窗口会被后续的淡入/移图逻辑重新点亮，导致 UHID 模式下
+            // 系统光标和自绘光标同时出现。
+            // 这里不看 overlayAdded 标志——它可能与实际窗口状态不同步（实测窗口还在但标志已 false）。
             handler.removeCallbacks(idleHideRunnable)
-            params.alpha = 0f
-        }
-        if (overlayAdded && view.isAttachedToWindow) {
-            runCatching { windowManager.updateViewLayout(view, params) }
+            runCatching { windowManager.removeView(view) }
+                .onFailure { Log.d(TAG, "移除自绘光标失败（可能本就未挂载）", it) }
+            overlayAdded = false
         }
     }
 
@@ -1068,58 +1142,13 @@ class MouseService : Service() {
      * 震动在专用线程执行，不阻塞注入线程。
      */
     private fun vibrateOnce(kind: VibrationKind, durationMs: Long = VIBRATE_MS) {
-        val settings = vibrationSettings
-        if (!settings.enabled || settings.amplitude <= 0) return
-        val allowed = when (kind) {
-            VibrationKind.CLICK -> settings.clickEnabled
-            VibrationKind.MODE_TOGGLE -> settings.modeToggleEnabled
-            VibrationKind.SCREENSHOT -> settings.screenshotEnabled
-            // 亮度反馈是可选提示，只受总开关/强度控制。
-            VibrationKind.BRIGHTNESS -> true
-        }
-        if (!allowed) return
-
-        // FF_RUMBLE 的 strong/weak_magnitude 为 0..65535；强度 0% 时不震。
-        val strength = (MAX_FF_STRENGTH.toLong() * settings.intensity / 100L)
-            .toInt().coerceIn(0, MAX_FF_STRENGTH)
-        if (strength <= 0) return
-        val duration = durationMs.toInt().coerceAtLeast(1)
-
-        if (!serviceManager.isReady) {
-            vibratePhone(durationMs)
-            return
-        }
-        if (rumbleExecutor.isShutdown) return
-        rumbleExecutor.execute {
-            val effectId = try {
-                serviceManager.rumble(duration, strength)
-            } catch (t: Throwable) {
-                Log.w(TAG_VIBRATE, "手柄震动调用失败，回退手机震动", t)
-                -1
-            }
-            when {
-                // -4 = 60ms 节流：连续触发直接丢弃，不回退手机以免重复震。
-                effectId == -4 -> Unit
-                effectId < 0 -> {
-                    Log.w(TAG_VIBRATE, "手柄震动不可用（code=" + effectId + "），回退手机震动")
-                    val reason = runCatching { serviceManager.hapticsStatus() }
-                        .getOrNull()?.takeIf { it.isNotBlank() }
-                    handler.post {
-                        vibratePhone(durationMs)
-                        MouseService.setHapticsState(reason)
-                        // 界面提示具体原因（同一原因 5 秒内只提示一次，避免连续点击刷屏）。
-                        if (reason != null) {
-                            val now = SystemClock.uptimeMillis()
-                            if (now - lastHapticsToastAt >= HAPTICS_TOAST_INTERVAL_MS) {
-                                lastHapticsToastAt = now
-                                Toast.makeText(this@MouseService, reason, Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    }
-                }
-                else -> Log.d(TAG_VIBRATE, "手柄震动已下发：effect=" + effectId + " " + duration + "ms strength=" + strength)
-            }
-        }
+        // 震动功能已整体移除。
+        //
+        // 原因：手柄 FF_RUMBLE 走 EVIOCSFF 被 SELinux 拒绝（errno=EPERM），
+        // 每次触发都会回退手机马达并弹「手柄震动不可用」Toast，5 秒一条，
+        // 持续骚扰用户。产品决定不做震动，这里直接短路，
+        // 不再下发 rumble、不再回退手机震动、也不再弹提示。
+        return
     }
 
     /** 手机马达回退（M11 实现）：仅在无手柄或 FF 下发失败时使用。 */

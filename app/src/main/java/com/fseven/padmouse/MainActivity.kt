@@ -290,6 +290,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        MouseRuntime.appForeground = true
         // 从 Shizuku/悬浮窗设置页返回后自动刷新状态。
         renderStatus()
         updatePermissionStatusUi()
@@ -329,6 +330,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        MouseRuntime.appForeground = false
         runStatusValue.removeCallbacks(runStatePoller)
         mappingStatus.removeCallbacks(mappingPoller)
         super.onPause()

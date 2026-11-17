@@ -263,13 +263,14 @@ class GamepadReader(
             // 摇杆静止时内核会持续上报同值，做一次去重避免刷屏。
             if (session.lastAbsValues[code] == value) return
             session.lastAbsValues[code] = value
+            // 按设备能力重映射轴语义（右摇杆 → RX/RY，扳机 → Z/RZ），上层只认一套。
+            val mapped = session.info.axisRemap[code] ?: code
+            runCatching { target.onEvent(type, mapped, value) }
+            val range = session.info.axes[code] ?: return
+            runCatching { target.onAxis(mapped, normalize(value, range.min, range.max)) }
+            return
         }
         runCatching { target.onEvent(type, code, value) }
-        if (type == EV_ABS) {
-            val range = session.info.axes[code] ?: return
-            val normalized = normalize(value, range.min, range.max)
-            runCatching { target.onAxis(code, normalized) }
-        }
     }
 
     private fun recordExclusiveFailure(deviceName: String, reason: String) {
@@ -607,6 +608,15 @@ class GamepadReader(
 
         fun toDescriptor(): DeviceDescriptor {
             val codes = keyNames.mapNotNull { KEY_CODES[it] }.toSet()
+            // 自适应轴语义：没有 ABS_RX/ABS_RY 的设备，其 ABS_Z/ABS_RZ 实际是右摇杆，
+            // 扳机在 ABS_GAS/ABS_BRAKE。统一重映射成「右摇杆=RX/RY、扳机=Z/RZ」。
+            val remap = LinkedHashMap<Int, Int>()
+            if (!axes.containsKey(GamepadAxes.ABS_RX) && !axes.containsKey(GamepadAxes.ABS_RY)) {
+                if (axes.containsKey(GamepadAxes.ABS_Z)) remap[GamepadAxes.ABS_Z] = GamepadAxes.ABS_RX
+                if (axes.containsKey(GamepadAxes.ABS_RZ)) remap[GamepadAxes.ABS_RZ] = GamepadAxes.ABS_RY
+                if (axes.containsKey(GamepadAxes.ABS_GAS)) remap[GamepadAxes.ABS_GAS] = GamepadAxes.ABS_Z
+                if (axes.containsKey(GamepadAxes.ABS_BRAKE)) remap[GamepadAxes.ABS_BRAKE] = GamepadAxes.ABS_RZ
+            }
             return DeviceDescriptor(
                 path = path,
                 name = name.ifBlank { path.substringAfterLast('/') },
@@ -614,6 +624,7 @@ class GamepadReader(
                 keyNames = keyNames.toSet(),
                 keyCodes = codes,
                 hasRumble = ffNames.contains("FF_RUMBLE"),
+                axisRemap = remap,
             )
         }
     }
@@ -743,6 +754,9 @@ object GamepadAxes {
     const val ABS_RX = 3
     const val ABS_RY = 4
     const val ABS_RZ = 5
+    /** 扳机轴（部分手柄用它替代 ABS_Z/ABS_RZ 作扳机）。 */
+    const val ABS_GAS = 9
+    const val ABS_BRAKE = 10
     const val ABS_HAT0X = 16
     const val ABS_HAT0Y = 17
     const val BTN_SOUTH = 0x130
@@ -778,6 +792,17 @@ data class DeviceDescriptor(
     val keyCodes: Set<Int>,
     /** M13：getevent -pl 的 FF 能力中是否包含 FF_RUMBLE。 */
     val hasRumble: Boolean = false,
+    /**
+     * 轴重映射：不同手柄的右摇杆/扳机轴定义不同。
+     *
+     * 实测 Xbox Wireless Controller（蓝牙）：
+     *   ABS_X/ABS_Y = 左摇杆, ABS_Z/ABS_RZ = 右摇杆, ABS_GAS/ABS_BRAKE = 扳机
+     * 而通用 XInput 驱动常见的是：ABS_RX/ABS_RY = 右摇杆, ABS_Z/ABS_RZ = 扳机。
+     *
+     * 因此按设备实际能力把「右摇杆」统一映射到 RX/RY、「扳机」统一映射到 Z/RZ，
+     * 让上层绑定表只认一套语义。
+     */
+    val axisRemap: Map<Int, Int> = emptyMap(),
 ) {
     val isGamepad: Boolean
         get() = axes.containsKey(GamepadAxes.ABS_X) &&

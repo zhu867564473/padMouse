@@ -49,6 +49,17 @@ object MouseRuntime {
     @Volatile
     var mappingRunning: Boolean = false
 
+    /**
+     * 本 App 的界面是否在前台。
+     *
+     * UHID 模式下系统在部分 App（微信、微信读书等）里不画系统光标
+     * （CursorInputMapper 的 DisplayId 停在 -1），此时需要用自绘光标兜底；
+     * 但回到我们自己的界面时系统光标是显示的，必须收回自绘光标，
+     * 否则会出现两个箭头。
+     */
+    @Volatile
+    var appForeground: Boolean = false
+
     @Volatile
     var cursorX: Float = 0f
 

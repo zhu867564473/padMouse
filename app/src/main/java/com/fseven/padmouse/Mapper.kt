@@ -3,6 +3,7 @@ package com.fseven.padmouse
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.MotionEvent
 import kotlin.math.hypot
 import kotlin.math.pow
@@ -273,6 +274,8 @@ class Mapper(
     /** 按键事件：value = 1 按下 / 0 松开 / 2 自动重复。 */
     fun onKey(code: Int, value: Int) {
         if (!running || value == 2) return
+        // 诊断：记录所有按键事件，用于确认「移动后自动点击」是否由真实按键触发。
+        Log.d("PadMouseMapper", "onKey code=$code(0x${code.toString(16)}) value=$value bound=${config.buttonBindings[code]}")
         if (value == 1) {
             if (!heldKeys.add(code)) return
             onKeyDown(code)
@@ -523,6 +526,8 @@ class Mapper(
     private fun updateHold(action: MouseAction, normalized: Float) {
         val press = normalized >= config.triggerThreshold
         val release = normalized <= config.triggerThreshold * DefaultBindings.TRIGGER_RELEASE_RATIO
+        // 诊断：扳机轴驱动左/右键时记录数值，用于定位「随机点击」是哪个轴在抖。
+        Log.d("PadMouseMapper", "updateHold action=$action value=$normalized press=$press release=$release held=$primaryHeld/$secondaryHeld")
         when (action) {
             MouseAction.LEFT_HOLD -> {
                 if (press && !primaryHeld) {
@@ -690,8 +695,9 @@ class Mapper(
         if (downNotches == 0) return
 
         if (inputMode == InputMode.UHID) {
-            // HID Wheel 正数 = 向上；触摸注入的 v=+1 = 向下，这里取反保持手感一致。
-            runCatching { injector.uhidWheel(-downNotches) }
+            // 实测：本机 Xbox 手柄（蓝牙）的右摇杆 Y（原 ABS_RZ，重映射为 ABS_RY）
+            // 方向与标准 ABS_RY 相反，因此这里不再取反，否则「上推=向下滚」。
+            runCatching { injector.uhidWheel(downNotches) }
         } else {
             val v = if (downNotches > 0) 1f else -1f
             repeat(kotlin.math.abs(downNotches)) {

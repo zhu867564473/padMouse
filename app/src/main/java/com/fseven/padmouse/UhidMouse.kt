@@ -3,6 +3,7 @@ package com.fseven.padmouse
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -48,6 +49,10 @@ class UhidMouse {
     private var devicePfd: ParcelFileDescriptor? = null
     private var output: FileOutputStream? = null
 
+    /** 消费 uhid 内核事件队列的读线程。 */
+    @Volatile
+    private var eventThread: Thread? = null
+
     @Volatile
     private var created = false
 
@@ -78,18 +83,25 @@ class UhidMouse {
                     return "ERROR: ${lastError}"
                 }
 
-                val pfd = ParcelFileDescriptor.open(device, ParcelFileDescriptor.MODE_WRITE_ONLY)
+                // uhid 是双向字符设备：内核通过同一 fd 的读队列回送 UHID_START/OPEN 等事件。
+                // 必须用 O_RDWR 打开（MODE_WRITE_ONLY 会导致创建路径失败，且无法消费事件队列）。
+                val pfd = ParcelFileDescriptor.open(device, ParcelFileDescriptor.MODE_READ_WRITE)
                 devicePfd = pfd
                 val stream = FileOutputStream(pfd.fileDescriptor)
                 output = stream
 
                 // 写 UHID_CREATE2：内核返回错误（EINVAL 等）时 FileOutputStream 抛 IOException。
-                stream.write(buildCreate2Packet())
+                val packet = buildCreate2Packet()
+                Log.i(TAG, "create: writing UHID_CREATE2 ${packet.size}B (header=$CREATE2_HEADER_SIZE desc=${REPORT_DESCRIPTOR.size})")
+                stream.write(packet)
                 stream.flush()
                 created = true
+                startEventReader(pfd)
+                Log.i(TAG, "create: OK ${statusLocked()}")
                 statusLocked()
             } catch (t: Throwable) {
                 lastError = "${t.javaClass.simpleName}: ${t.message}"
+                Log.w(TAG, "create: FAILED $lastError", t)
                 created = false
                 closeQuietly()
                 "ERROR: ${lastError}"
@@ -134,6 +146,7 @@ class UhidMouse {
         synchronized(writeLock) {
             val next = mask and BUTTON_MASK
             if (next == buttonMask) return
+            Log.d(TAG, "setButtons mask=$next (prev=$buttonMask)")
             buttonMask = next
             if (!created || output == null) return
             writeRawLocked(buildInputPacket(buttonMask, 0, 0, 0))
@@ -168,7 +181,47 @@ class UhidMouse {
             "buttons=$buttonMask descriptor=${REPORT_DESCRIPTOR.size}B"
     }
 
+    /**
+     * 读线程：消费内核回送的 UHID_START / UHID_OPEN / UHID_OUTPUT 等事件。
+     * uhid 是双向设备，读队列（32 条）长期不消费会丢事件，且无法感知设备是否真正 ready。
+     */
+    private fun startEventReader(pfd: ParcelFileDescriptor) {
+        stopEventReader()
+        val fd = pfd.fileDescriptor
+        eventThread = Thread({
+            val input = try {
+                FileInputStream(fd)
+            } catch (t: Throwable) {
+                Log.w(TAG, "event reader open failed: ${t.message}")
+                return@Thread
+            }
+            val buf = ByteArray(4384)
+            while (!closing) {
+                try {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    if (n >= 4) {
+                        val type = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                        Log.d(TAG, "uhid event type=$type len=$n")
+                    }
+                } catch (t: Throwable) {
+                    if (!closing) Log.d(TAG, "event reader end: ${t.javaClass.simpleName}: ${t.message}")
+                    break
+                }
+            }
+        }, "uhid-events").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun stopEventReader() {
+        eventThread?.interrupt()
+        eventThread = null
+    }
+
     private fun closeQuietly() {
+        stopEventReader()
         runCatching { output?.close() }
         runCatching { devicePfd?.close() }
         output = null
@@ -202,7 +255,12 @@ class UhidMouse {
         buffer.put(fixedString(PHYS, 64))
         buffer.put(ByteArray(64)) // uniq：留空
         buffer.putShort(descriptor.size.toShort())
-        buffer.putShort(BUS_USB.toShort())
+        // 用 BUS_VIRTUAL 而不是 BUS_USB：
+        // EventHub 判定 bus==USB/BLUETOOTH 即 isExternal=true，而外部设备的
+        // CursorInputMapper 在拿不到 AssociatedDisplay 时 DisplayId 会停在 -1，
+        // 系统就不画系统光标（实测微信/微信读书里指针完全消失）。
+        // 声明为虚拟设备 → isExternal=false → DisplayId 回落主屏 0 → 光标正常。
+        buffer.putShort(BUS_VIRTUAL.toShort())
         buffer.putInt(VENDOR_ID)
         buffer.putInt(PRODUCT_ID)
         buffer.putInt(VERSION)
@@ -212,12 +270,13 @@ class UhidMouse {
     }
 
     /** type + size(u16) + [buttons, dx, dy, wheel]。 */
-    private fun buildInputPacket(buttons: Int, dx: Int, dy: Int, wheel: Int): ByteArray {
+    private fun buildInputPacket(buttons: Int, dx: Int, dy: Int, wheel: Int, hwheel: Int = 0): ByteArray {
         val data = byteArrayOf(
             (buttons and BUTTON_MASK).toByte(),
             dx.coerceIn(-HID_MAX_STEP, HID_MAX_STEP).toByte(),
             dy.coerceIn(-HID_MAX_STEP, HID_MAX_STEP).toByte(),
             wheel.coerceIn(-HID_MAX_STEP, HID_MAX_STEP).toByte(),
+            hwheel.coerceIn(-HID_MAX_STEP, HID_MAX_STEP).toByte(),
         )
         val buffer = ByteBuffer.allocate(INPUT2_HEADER_SIZE + data.size)
             .order(ByteOrder.LITTLE_ENDIAN)
@@ -242,7 +301,10 @@ class UhidMouse {
 
         private const val UHID_PATH = "/dev/uhid"
         private const val DEVICE_NAME = "PadMouse Virtual Mouse"
-        private const val PHYS = "padmouse/uhid"
+        // phys 留空，与 scrcpy 完全一致。
+        // 填 "padmouse/uhid" 会让 InputReader 记录成自定义 Location，
+        // 实测会导致部分 App（微信/微信读书）不绘制系统光标。
+        private const val PHYS = ""
 
         // 常量取自 include/uapi/linux/uhid.h（见类注释）。
         private const val UHID_DESTROY = 1
@@ -250,9 +312,13 @@ class UhidMouse {
         private const val UHID_INPUT2 = 12
 
         private const val BUS_USB = 0x03
-        private const val VENDOR_ID = 0x1209
-        private const val PRODUCT_ID = 0x0001
-        private const val VERSION = 1
+        private const val BUS_VIRTUAL = 0x06
+        // 与 scrcpy 的 UHID 鼠标完全对齐：vendor/product 都用 0。
+        // 实测 0x1209(pid.codes 测试用 ID) 会被部分 App 当作未知设备，
+        // 不做指针光标渲染；换成 0/0 后与 scrcpy 行为一致（微信/微信读书内可见系统光标）。
+        private const val VENDOR_ID = 0x0000
+        private const val PRODUCT_ID = 0x0000
+        private const val VERSION = 0
         private const val COUNTRY = 0
 
         /** uhid_create2_req 在 rd_data 之前的固定长度：4+128+64+64+2+2+4*4 = 280。 */
@@ -264,7 +330,7 @@ class UhidMouse {
         private const val MAX_SPLITS = 64
 
         /** 4 字节 report：[buttons][dx][dy][wheel]。 */
-        private const val REPORT_SIZE = 4
+        private const val REPORT_SIZE = 5
 
         /**
          * 标准「3 键 + 滚轮」相对鼠标 descriptor。
@@ -291,11 +357,20 @@ class UhidMouse {
             0x05, 0x01,        //     Usage Page (Generic Desktop)
             0x09, 0x30,        //     Usage (X)
             0x09, 0x31,        //     Usage (Y)
-            0x09, 0x38,        //     Usage (Wheel)
+            0x09, 0x38,        //     Usage (Wheel) —— 垂直滚轮 → REL_WHEEL
             0x15, 0x81,        //     Logical Minimum (-127)
             0x25, 0x7F,        //     Logical Maximum (127)
             0x75, 0x08,        //     Report Size (8)
             0x95, 0x03,        //     Report Count (3)
+            0x81, 0x06,        //     Input (Data, Variable, Relative)
+            // 横向滚轮（AC Pan）：由 hid-input 映射成 REL_HWHEEL。
+            // 加上它之后设备能力与 scrcpy 的 UHID 鼠标完全一致（HaveHWheel=true）。
+            0x05, 0x0C,        //     Usage Page (Consumer)
+            0x0A, 0x38, 0x02,  //     Usage (AC Pan)
+            0x15, 0x81,        //     Logical Minimum (-127)
+            0x25, 0x7F,        //     Logical Maximum (127)
+            0x75, 0x08,        //     Report Size (8)
+            0x95, 0x01,        //     Report Count (1)
             0x81, 0x06,        //     Input (Data, Variable, Relative)
             0xC0,              //   End Collection (Physical)
             0xC0,              // End Collection (Application)
