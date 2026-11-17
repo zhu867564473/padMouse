@@ -52,4 +52,12 @@ interface IPadMouse {
     void uhidMouseWheel(int delta);
     // 当前设备状态（active=true ... / active=false / ERROR: ...）。
     String uhidStatus();
+
+    // M13 手柄震动：FF_RUMBLE 直接写 /dev/input/eventX（手柄未注册为系统 vibrator）。
+    // strength 为 0..65535；成功返回 effect id（>= 0），失败返回负值（-errno / 节流 / 不可用）。
+    // 到时由 UserService 自动 stop + destroy，调用方无需再回收。
+    int rumble(int durationMs, int strength);
+    void rumbleStop(int effectId);
+    // 空串 = 手柄震动可用；否则为「手柄震动不可用：<原因>」。
+    String hapticsStatus();
 }

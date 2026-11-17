@@ -352,15 +352,19 @@ class GamepadReader(
                 section = when (sectionMatch.groupValues[1]) {
                     "KEY" -> EV_KEY
                     "ABS" -> EV_ABS
+                    // M13：getevent -pl 的 FF (0015) 区段，用来判定 FF_RUMBLE 能力。
+                    "FF" -> EV_FF
                     else -> 0
                 }
                 val rest = sectionMatch.groupValues[3]
                 if (section == EV_KEY) collectKeyNames(rest, device.keyNames)
                 if (section == EV_ABS) collectAxes(rest, device.axes)
+                if (section == EV_FF) collectFfNames(rest, device.ffNames)
                 continue
             }
             if (section == EV_KEY) collectKeyNames(line, device.keyNames)
             if (section == EV_ABS) collectAxes(line, device.axes)
+            if (section == EV_FF) collectFfNames(line, device.ffNames)
         }
         return devices.map { it.toDescriptor() }
     }
@@ -377,6 +381,36 @@ class GamepadReader(
 
     private fun collectKeyNames(text: String, names: MutableSet<String>) {
         KEY_NAME_RE.findAll(text).forEach { names.add(it.value) }
+    }
+
+    /** FF (0015) 能力名，如 FF_RUMBLE / FF_PERIODIC。 */
+    private fun collectFfNames(text: String, names: MutableSet<String>) {
+        FF_NAME_RE.findAll(text).forEach { names.add(it.value) }
+    }
+
+    /** 当前可用于 FF 下发的设备与 fd；没有可写且支持 FF_RUMBLE 的设备时返回 null。 */
+    fun rumbleTarget(): RumbleTarget? = synchronized(sessionLock) {
+        for (session in sessions.values) {
+            if (!session.info.hasRumble || !session.writable) continue
+            val fd = session.rawFd() ?: continue
+            return@synchronized RumbleTarget(fd)
+        }
+        null
+    }
+
+    /**
+     * 手柄震动可用性：空串表示可用，否则为可直接展示的「手柄震动不可用：<原因>」。
+     *
+     * 优先级：未连接 > 不支持 FF_RUMBLE > O_RDWR 失败（设备无法写入）。
+     */
+    fun hapticsStatus(): String = synchronized(sessionLock) {
+        if (sessions.isEmpty()) return "手柄震动不可用：未连接手柄"
+        val ffCapable = sessions.values.filter { it.info.hasRumble }
+        if (ffCapable.isEmpty()) return "手柄震动不可用：设备不支持 FF_RUMBLE"
+        val writable = ffCapable.firstOrNull { it.writable && it.rawFd() != null }
+            ?: return "手柄震动不可用：设备无法写入" +
+                (ffCapable.firstOrNull()?.writeError?.let { "（$it）" } ?: "")
+        ""
     }
 
     private fun normalize(value: Int, min: Int, max: Int): Float {
@@ -444,6 +478,14 @@ class GamepadReader(
         @Volatile var closed: Boolean = false
         val lastAbsValues = HashMap<Int, Int>()
 
+        /** M13：是否以 O_RDWR 打开（FF 下发需要可写 fd）。 */
+        @Volatile var writable: Boolean = false
+            private set
+
+        /** O_RDWR 失败时的原因；随后已回退 O_RDONLY 继续读事件。 */
+        @Volatile var writeError: String? = null
+            private set
+
         private var pfd: ParcelFileDescriptor? = null
 
         /** Os.open 返回的 FileDescriptor，供 ioctl 使用；关闭时置空避免误用。 */
@@ -454,8 +496,20 @@ class GamepadReader(
             private set
 
         fun open() {
+            // M13：FF_RUMBLE 必须写设备，优先 O_RDWR；失败时回退 O_RDONLY 继续读事件，
+            // 并把「设备无法写入」原因留给界面展示，不得静默。
+            var fileDescriptor: FileDescriptor
+            try {
+                fileDescriptor = Os.open(info.path, OsConstants.O_RDWR, 0)
+                writable = true
+                writeError = null
+            } catch (t: Throwable) {
+                writeError = t.message ?: t.javaClass.simpleName
+                fileDescriptor = Os.open(info.path, OsConstants.O_RDONLY, 0)
+                writable = false
+                Log.w(TAG, "O_RDWR 打开失败，回退 O_RDONLY（手柄震动不可用）：$writeError")
+            }
             // Os.open 返回 FileDescriptor；adoptFd 需要裸 fd，这里取出其内部 descriptor。
-            val fileDescriptor = Os.open(info.path, OsConstants.O_RDONLY, 0)
             val rawFd = try {
                 descriptorInt(fileDescriptor)
             } catch (t: Throwable) {
@@ -467,6 +521,9 @@ class GamepadReader(
             pfd = descriptor
             stream = FileInputStream(descriptor.fileDescriptor)
         }
+
+        /** 当前裸 fd；设备已关闭时返回 null。 */
+        fun rawFd(): Int? = osFd?.let { fd -> runCatching { descriptorInt(fd) }.getOrNull() }
 
         /** 独占设备；返回 null 表示成功，否则为失败原因（含 ioctl 非 0 返回）。 */
         fun grab(): String? {
@@ -546,6 +603,7 @@ class GamepadReader(
         var name: String = ""
         val keyNames = LinkedHashSet<String>()
         val axes = LinkedHashMap<Int, AxisRange>()
+        val ffNames = LinkedHashSet<String>()
 
         fun toDescriptor(): DeviceDescriptor {
             val codes = keyNames.mapNotNull { KEY_CODES[it] }.toSet()
@@ -555,6 +613,7 @@ class GamepadReader(
                 axes = axes.toMap(),
                 keyNames = keyNames.toSet(),
                 keyCodes = codes,
+                hasRumble = ffNames.contains("FF_RUMBLE"),
             )
         }
     }
@@ -567,6 +626,7 @@ class GamepadReader(
         private const val EVENT_VALUE_OFFSET = 20
         private const val EV_KEY = 1
         private const val EV_ABS = 3
+        private const val EV_FF = 0x15
         private const val SCAN_INTERVAL_MS = 2_000L
 
         private const val TAG = "GamepadReader"
@@ -583,6 +643,7 @@ class GamepadReader(
             "(ABS_[A-Z0-9_]+)\\s*:\\s*value\\s*(-?\\d+)\\s*,\\s*min\\s*(-?\\d+)\\s*,\\s*max\\s*(-?\\d+)"
         )
         private val KEY_NAME_RE = Regex("\\b(?:BTN|KEY)_[A-Z0-9_]+\\b")
+        private val FF_NAME_RE = Regex("\\bFF_[A-Z0-9_]+\\b")
 
         private val KEY_CODES: Map<String, Int> = mapOf(
             "BTN_SOUTH" to 0x130,
@@ -705,6 +766,9 @@ object GamepadAxes {
     val CODES: Map<String, Int> = NAMES.entries.associate { (code, name) -> name to code }
 }
 
+/** M13：用于 FF_RUMBLE 下发的可写手柄 fd。 */
+data class RumbleTarget(val fd: Int)
+
 /** /dev/input 设备描述（getevent -pl 解析结果）。 */
 data class DeviceDescriptor(
     val path: String,
@@ -712,6 +776,8 @@ data class DeviceDescriptor(
     val axes: Map<Int, AxisRange>,
     val keyNames: Set<String>,
     val keyCodes: Set<Int>,
+    /** M13：getevent -pl 的 FF 能力中是否包含 FF_RUMBLE。 */
+    val hasRumble: Boolean = false,
 ) {
     val isGamepad: Boolean
         get() = axes.containsKey(GamepadAxes.ABS_X) &&

@@ -10,6 +10,8 @@ import android.view.MotionEvent
 import java.io.File
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * 运行在 Shizuku UserService 进程（shell uid）内的注入实现。
@@ -54,6 +56,15 @@ class PadMouseUserService : IPadMouse.Stub() {
     /** M12：UHID 虚拟鼠标；fd、上报与销毁全部在 shell 进程内。 */
     private val uhidLock = Any()
     private var uhidMouse: UhidMouse? = null
+
+    /** M13：手柄 FF_RUMBLE 下发状态；到时自动 stop + destroy。 */
+    private val rumbleLock = Any()
+    private var lastRumbleAt = 0L
+    private var activeEffectId = -1
+    private var rumbleError: String? = null
+    private val rumbleExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "gamepad-rumble").apply { isDaemon = true }
+    }
 
     override fun tap(x: Float, y: Float) {
         try {
@@ -291,6 +302,92 @@ class PadMouseUserService : IPadMouse.Stub() {
         return reader?.describe() ?: GamepadReader.describeOnce()
     }
 
+    // ---------------------------------------------------------------- M13 手柄震动（FF_RUMBLE）
+
+    /**
+     * 直接向手柄写 FF_RUMBLE：EVIOCSFF 分配 effect → EV_FF 启动。
+     *
+     * 连续触发节流 60ms（避免点击抖动把内核 effect 表打满）；strength 0 直接跳过。
+     * 成功返回 effect id（>= 0）；负值表示失败（-1 不可用、-3 参数、-4 节流）。
+     */
+    override fun rumble(durationMs: Int, strength: Int): Int {
+        if (durationMs <= 0 || strength <= 0) return -3
+        synchronized(rumbleLock) {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastRumbleAt < RUMBLE_THROTTLE_MS) return -4
+            lastRumbleAt = now
+        }
+        val reader = synchronized(gamepadLock) { gamepadReader }
+            ?: return unavailableRumble("未启动手柄读取")
+        val target = reader.rumbleTarget()
+            ?: return unavailableRumble(
+                reader.hapticsStatus().removePrefix(HAPTICS_PREFIX).ifBlank { "设备不支持 FF_RUMBLE" }
+            )
+        if (!NativeIoctl.ensureLoaded(libPaths)) {
+            return unavailableRumble("原生 ioctl 库不可用：" + (NativeIoctl.loadError ?: "未知原因"))
+        }
+        val effectId = try {
+            NativeIoctl.nativeRumble(target.fd, durationMs, strength)
+        } catch (t: Throwable) {
+            return unavailableRumble(t.javaClass.simpleName + ": " + (t.message ?: "nativeRumble 调用失败"))
+        }
+        if (effectId < 0) {
+            return unavailableRumble(errnoText(-effectId))
+        }
+        synchronized(rumbleLock) {
+            rumbleError = null
+            activeEffectId = effectId
+        }
+        // 到期回收：先写 EV_FF 0 停震，再 EVIOCRMFF 释放 effect。
+        rumbleExecutor.schedule({
+            runCatching { NativeIoctl.nativeRumbleStop(target.fd, effectId) }
+            runCatching { NativeIoctl.nativeRumbleDestroy(target.fd, effectId) }
+            synchronized(rumbleLock) {
+                if (activeEffectId == effectId) activeEffectId = -1
+            }
+        }, durationMs.toLong() + RUMBLE_STOP_DELAY_MS, TimeUnit.MILLISECONDS)
+        return effectId
+    }
+
+    override fun rumbleStop(effectId: Int) {
+        if (effectId < 0) return
+        val reader = synchronized(gamepadLock) { gamepadReader } ?: return
+        val target = reader.rumbleTarget() ?: return
+        runCatching { NativeIoctl.nativeRumbleStop(target.fd, effectId) }
+        synchronized(rumbleLock) {
+            if (activeEffectId == effectId) activeEffectId = -1
+        }
+    }
+
+    override fun hapticsStatus(): String {
+        val reader = synchronized(gamepadLock) { gamepadReader }
+            ?: return HAPTICS_PREFIX + "未启动手柄读取"
+        val deviceStatus = reader.hapticsStatus()
+        if (deviceStatus.isNotBlank()) return deviceStatus
+        synchronized(rumbleLock) {
+            rumbleError?.let { return HAPTICS_PREFIX + it }
+        }
+        return ""
+    }
+
+    /** 记录失败原因供 hapticsStatus() 展示，并返回失败码。 */
+    private fun unavailableRumble(reason: String): Int {
+        synchronized(rumbleLock) { rumbleError = reason }
+        return -1
+    }
+
+    /** errno → 可读原因。 */
+    private fun errnoText(errno: Int): String = when (errno) {
+        1 -> "EPERM(1)"
+        6 -> "ENXIO(6)"
+        13 -> "EACCES(13)"
+        16 -> "EBUSY(16)"
+        19 -> "ENODEV(19)"
+        22 -> "EINVAL(22)"
+        25 -> "ENOTTY(25)"
+        else -> "errno=" + errno
+    }
+
     override fun shellExec(cmd: String): String {
         return try {
             val process = ProcessBuilder("sh", "-c", cmd)
@@ -459,5 +556,13 @@ class PadMouseUserService : IPadMouse.Stub() {
     companion object {
         /** InputManager.INJECT_INPUT_EVENT_MODE_ASYNC */
         private const val INJECT_MODE_ASYNC = 0
+
+        /** M13 手柄震动：连续触发节流 >= 60ms，避免内核 effect 表抖动。 */
+        private const val RUMBLE_THROTTLE_MS = 60L
+
+        /** 到期回收前多等一点，确保内核 replay.length 已走完。 */
+        private const val RUMBLE_STOP_DELAY_MS = 20L
+
+        private const val HAPTICS_PREFIX = "手柄震动不可用："
     }
 }

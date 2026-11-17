@@ -120,6 +120,11 @@ class MouseService : Service() {
     /** 注入与 shell 命令放到单线程，保证 down/move/up 顺序。 */
     private val injectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
+    /** M13：手柄 FF_RUMBLE 走独立线程，震动 Binder 调用不阻塞注入/主线程。 */
+    private val rumbleExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "gamepad-rumble").apply { isDaemon = true }
+    }
+
     private var cursorView: CursorView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
 
@@ -170,6 +175,9 @@ class MouseService : Service() {
     /** 游戏模式下窗口 alpha 归零，避免残留光标。 */
     private var overlayHidden = false
 
+    /** 手柄震动不可用提示的节流时间戳。 */
+    private var lastHapticsToastAt = 0L
+
     /** 模式切换热键绑定（缓存，避免每个按键事件都读 SharedPreferences）。 */
     private var modeToggleBinding: ActionBinding = SettingsRepository.DEFAULT_MODE_TOGGLE_BINDING
 
@@ -183,6 +191,7 @@ class MouseService : Service() {
     private val exclusiveStatusPoller = object : Runnable {
         override fun run() {
             refreshExclusiveStatus()
+            refreshHapticsStatus()
             handler.postDelayed(this, EXCLUSIVE_POLL_MS)
         }
     }
@@ -229,7 +238,7 @@ class MouseService : Service() {
             // M11：点击震动（左键 / 右键），受分项开关控制。
             when (action) {
                 MapperAction.TAP,
-                MapperAction.RIGHT_CLICK -> vibrateOnce(VibrationKind.CLICK)
+                MapperAction.RIGHT_CLICK -> vibrateOnce(VibrationKind.CLICK, VIBRATE_CLICK_MS)
 
                 else -> Unit
             }
@@ -305,7 +314,7 @@ class MouseService : Service() {
             when (action) {
                 SystemAction.SCREENSHOT -> {
                     if (result.success) {
-                        vibrateOnce(VibrationKind.SCREENSHOT)
+                        vibrateOnce(VibrationKind.SCREENSHOT, VIBRATE_SCREENSHOT_MS)
                         Toast.makeText(
                             this@MouseService,
                             R.string.toast_screenshot_ok,
@@ -568,6 +577,7 @@ class MouseService : Service() {
             modeToggleBinding = settingsRepository.loadModeToggleBinding()
             serviceManager.startGamepadCapture(gamepadListener)
             gamepadCaptureStarted = true
+            refreshHapticsStatus()
             true
         } catch (t: Throwable) {
             Log.w(TAG, "注册手柄监听失败", t)
@@ -597,6 +607,7 @@ class MouseService : Service() {
         if (effectiveInputMode == InputMode.TOUCH) setOverlayVisible(true)
         MouseService.setGameModeState(false)
         MouseService.setExclusiveState(false, null)
+        MouseService.setHapticsState(null)
     }
 
     private fun onUserServiceStateChanged(state: UserServiceState) {
@@ -1052,9 +1063,9 @@ class MouseService : Service() {
     /**
      * 按当前震动设置触发一次震动。
      *
-     * - API 31+ 优先取 [VibratorManager.defaultVibrator]，为空/失败回退 [Vibrator] 服务；
-     * - 用 [VibrationEffect.createOneShot] + 强度 amplitude；
-     * - amplitude 不被支持时 try/catch 降级到 [Vibrator.vibrate]（long）。
+     * M13：默认优先手柄（UserService 内 FF_RUMBLE 直接写 /dev/input/eventX）；
+     * 手柄不可用/ioctl 失败时才回退手机马达（M11 实现保留为回退）。
+     * 震动在专用线程执行，不阻塞注入线程。
      */
     private fun vibrateOnce(kind: VibrationKind, durationMs: Long = VIBRATE_MS) {
         val settings = vibrationSettings
@@ -1068,9 +1079,56 @@ class MouseService : Service() {
         }
         if (!allowed) return
 
+        // FF_RUMBLE 的 strong/weak_magnitude 为 0..65535；强度 0% 时不震。
+        val strength = (MAX_FF_STRENGTH.toLong() * settings.intensity / 100L)
+            .toInt().coerceIn(0, MAX_FF_STRENGTH)
+        if (strength <= 0) return
+        val duration = durationMs.toInt().coerceAtLeast(1)
+
+        if (!serviceManager.isReady) {
+            vibratePhone(durationMs)
+            return
+        }
+        if (rumbleExecutor.isShutdown) return
+        rumbleExecutor.execute {
+            val effectId = try {
+                serviceManager.rumble(duration, strength)
+            } catch (t: Throwable) {
+                Log.w(TAG_VIBRATE, "手柄震动调用失败，回退手机震动", t)
+                -1
+            }
+            when {
+                // -4 = 60ms 节流：连续触发直接丢弃，不回退手机以免重复震。
+                effectId == -4 -> Unit
+                effectId < 0 -> {
+                    Log.w(TAG_VIBRATE, "手柄震动不可用（code=" + effectId + "），回退手机震动")
+                    val reason = runCatching { serviceManager.hapticsStatus() }
+                        .getOrNull()?.takeIf { it.isNotBlank() }
+                    handler.post {
+                        vibratePhone(durationMs)
+                        MouseService.setHapticsState(reason)
+                        // 界面提示具体原因（同一原因 5 秒内只提示一次，避免连续点击刷屏）。
+                        if (reason != null) {
+                            val now = SystemClock.uptimeMillis()
+                            if (now - lastHapticsToastAt >= HAPTICS_TOAST_INTERVAL_MS) {
+                                lastHapticsToastAt = now
+                                Toast.makeText(this@MouseService, reason, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                }
+                else -> Log.d(TAG_VIBRATE, "手柄震动已下发：effect=" + effectId + " " + duration + "ms strength=" + strength)
+            }
+        }
+    }
+
+    /** 手机马达回退（M11 实现）：仅在无手柄或 FF 下发失败时使用。 */
+    private fun vibratePhone(durationMs: Long = VIBRATE_MS) {
+        val settings = vibrationSettings
+        if (!settings.enabled || settings.amplitude <= 0) return
         val vibrator = resolveVibrator()
         if (vibrator == null || !vibrator.hasVibrator()) {
-            Log.w(TAG_VIBRATE, "没有可用的震动马达，跳过 " + kind)
+            Log.w(TAG_VIBRATE, "没有可用的震动马达，跳过手机回退")
             return
         }
         // 注意：VibrationEffect.DEFAULT_AMPLITUDE 在部分 android.jar 中为 -1，
@@ -1087,6 +1145,19 @@ class MouseService : Service() {
             } catch (t2: Throwable) {
                 Log.w(TAG_VIBRATE, "震动失败", t2)
             }
+        }
+    }
+
+    /** 刷新手柄震动可用性（界面上报「手柄震动不可用：<原因>」）。 */
+    private fun refreshHapticsStatus() {
+        if (!serviceManager.isReady) {
+            MouseService.setHapticsState(getString(R.string.haptics_unavailable_service))
+            return
+        }
+        if (rumbleExecutor.isShutdown) return
+        rumbleExecutor.execute {
+            val status = runCatching { serviceManager.hapticsStatus() }.getOrNull()
+            MouseService.setHapticsState(status)
         }
     }
 
@@ -1271,15 +1342,34 @@ class MouseService : Service() {
         /** 震动日志统一用 TAG=Vibrator，方便真机排查。 */
         private const val TAG_VIBRATE = "Vibrator"
 
-        /** M11：60ms 太短，真机几乎无感；180ms 才能明显感到。 */
+        /** M11/M13：模式切换 180ms 才能明显感到；点击 40ms；截图 60ms。 */
         private const val VIBRATE_MS = 180L
+        private const val VIBRATE_CLICK_MS = 40L
+        private const val VIBRATE_SCREENSHOT_MS = 60L
         private const val VIBRATE_BRIGHTNESS_MS = 40L
+
+        /** FF_RUMBLE strong/weak_magnitude 的满量程。 */
+        private const val MAX_FF_STRENGTH = 0xFFFF
+
+        /** 「手柄震动不可用」Toast 去重间隔。 */
+        private const val HAPTICS_TOAST_INTERVAL_MS = 5_000L
 
         /**
          * 震动能力查询：设置页据此决定是否置灰「手柄震动」区块。
          * API 31+ 先看 VibratorManager.defaultVibrator，失败回退 Vibrator 服务。
          */
         fun isVibrationSupported(context: Context): Boolean {
+            // M13：手柄 FF_RUMBLE 是首选通道。服务已在上报不可用原因，或此刻能直接查到
+            // 不可用原因时，设置区置灰（避免只在「服务已运行很久」时才生效）。
+            val reason = hapticsUnavailableReason ?: runCatching {
+                val manager = MouseRuntime.ensureManager(context)
+                if (!manager.isReady) null
+                else manager.hapticsStatus().takeIf { it.isNotBlank() }
+            }.getOrNull()
+            if (reason != null) {
+                setHapticsState(reason)
+                return false
+            }
             val fromManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 runCatching {
                     context.getSystemService(VibratorManager::class.java)?.defaultVibrator
@@ -1331,6 +1421,18 @@ class MouseService : Service() {
         fun setExclusiveState(active: Boolean, error: String?) {
             exclusiveActive = active
             exclusiveError = error
+        }
+
+        /** M13：手柄震动不可用原因；null = 可用。 */
+        @Volatile
+        var hapticsUnavailableReason: String? = null
+            private set
+
+        fun setHapticsState(reason: String?) {
+            val value = reason?.takeIf { it.isNotBlank() }
+            if (value == hapticsUnavailableReason) return
+            hapticsUnavailableReason = value
+            MouseRuntime.notifyChanged()
         }
 
         fun setGameModeState(enabled: Boolean) {

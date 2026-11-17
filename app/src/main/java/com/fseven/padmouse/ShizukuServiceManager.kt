@@ -176,6 +176,13 @@ class ShizukuServiceManager(
 
     fun isGameMode(): Boolean = requireService().isGameMode()
 
+    // M13 手柄震动：FF_RUMBLE 在 UserService（shell 侧持有可写 fd）内下发。
+    fun rumble(durationMs: Int, strength: Int): Int = requireService().rumble(durationMs, strength)
+
+    fun rumbleStop(effectId: Int) = requireService().rumbleStop(effectId)
+
+    fun hapticsStatus(): String = requireService().hapticsStatus()
+
     private fun requireService(): IPadMouse =
         service ?: throw IllegalStateException("UserService 未连接，请先完成 Shizuku 授权")
 

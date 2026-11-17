@@ -73,6 +73,18 @@ internal object NativeIoctl {
 
     external fun nativeIoctl(fd: Int, request: Int, value: Int): Int
 
+    /**
+     * M13 手柄震动：构造 FF_RUMBLE 并 ioctl(EVIOCSFF)，成功后写 EV_FF 启动。
+     * 成功返回 effect id（>= 0），失败返回 -errno（< 0）。
+     */
+    external fun nativeRumble(fd: Int, durationMs: Int, strength: Int): Int
+
+    /** 写 EV_FF value=0 停止震动；0 = 成功，否则 errno。 */
+    external fun nativeRumbleStop(fd: Int, effectId: Int): Int
+
+    /** ioctl(EVIOCRMFF) 释放 effect；0 = 成功，否则 errno。 */
+    external fun nativeRumbleDestroy(fd: Int, effectId: Int): Int
+
     private fun load(path: String, errors: MutableList<String>): Boolean = try {
         System.load(path)
         loaded = true

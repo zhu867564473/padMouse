@@ -210,6 +210,7 @@
     <string name="vibration_mode_toggle_label">模式切换震动</string>
     <string name="vibration_screenshot_label">截图震动</string>
     <string name="vibration_unsupported">当前手柄不支持震动</string>
+    <string name="haptics_unavailable_service">手柄震动不可用：UserService 未连接</string>
     <string name="vibration_hint">强度 0% 等价关闭；改动立即生效并保存，不需要重启服务。截图、模式切换与点击反馈各自独立开关。</string>
 
     <string name="toast_screenshot_ok">已截图</string>
