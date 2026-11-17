@@ -15,6 +15,8 @@ import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.CompoundButton
 import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.Spinner
@@ -112,6 +114,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var feelDeadzoneValue: TextView
     private lateinit var feelExponentSeek: SeekBar
     private lateinit var feelExponentValue: TextView
+
+    // 四、设置：M11 震动反馈
+    private lateinit var vibrationSwitch: SwitchMaterial
+    private lateinit var vibrationIntensitySeek: SeekBar
+    private lateinit var vibrationIntensityValue: TextView
+    private lateinit var vibrationClickCheck: CheckBox
+    private lateinit var vibrationModeCheck: CheckBox
+    private lateinit var vibrationScreenshotCheck: CheckBox
+    private lateinit var vibrationUnsupported: TextView
 
     // 四、设置：按键绑定
     private lateinit var systemBindingsResetButton: Button
@@ -229,6 +240,13 @@ class MainActivity : AppCompatActivity() {
         feelExponentValue = findViewById(R.id.feel_exponent_value)
         exclusiveSwitch = findViewById(R.id.switch_exclusive_mode)
         modeToggleSpinner = findViewById(R.id.spinner_mode_toggle)
+        vibrationSwitch = findViewById(R.id.switch_vibration_enabled)
+        vibrationIntensitySeek = findViewById(R.id.seek_vibration_intensity)
+        vibrationIntensityValue = findViewById(R.id.vibration_intensity_value)
+        vibrationClickCheck = findViewById(R.id.check_vibration_click)
+        vibrationModeCheck = findViewById(R.id.check_vibration_mode_toggle)
+        vibrationScreenshotCheck = findViewById(R.id.check_vibration_screenshot)
+        vibrationUnsupported = findViewById(R.id.vibration_unsupported)
 
         settingsRepository = SettingsRepository(this)
 
@@ -257,6 +275,7 @@ class MainActivity : AppCompatActivity() {
         setupExclusiveControls()
         setupCursorControls()
         setupFeelControls()
+        setupVibrationControls()
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
         renderUserServiceState(MouseRuntime.userServiceState)
@@ -1156,6 +1175,104 @@ class MainActivity : AppCompatActivity() {
     /** 映射配置由 MouseService 持有；这里把最新设置推给服务。 */
     private fun pushMapperConfig() {
         MouseService.applyConfig(settingsRepository.loadMapperConfig(systemBindings))
+    }
+
+    // ---------------------------------------------------------------- 四、设置：M11 震动反馈
+
+    /**
+     * 震动区块：总开关 + 0/25/50/75/100% 强度 + 三个分项开关。
+     * 改动写入 SettingsRepository 后立刻通过 ACTION_UPDATE_VIBRATION 推给运行中的服务。
+     */
+    private fun setupVibrationControls() {
+        val settings = settingsRepository.loadVibrationSettings()
+        val supported = MouseService.isVibrationSupported(this)
+
+        vibrationSwitch.isChecked = settings.enabled
+        vibrationIntensitySeek.max = VibrationSettings.INTENSITY_STEPS.size - 1
+        vibrationIntensitySeek.progress = intensityIndex(settings.intensity)
+        vibrationClickCheck.isChecked = settings.clickEnabled
+        vibrationModeCheck.isChecked = settings.modeToggleEnabled
+        vibrationScreenshotCheck.isChecked = settings.screenshotEnabled
+        vibrationUnsupported.visibility = if (supported) View.GONE else View.VISIBLE
+        updateVibrationLabels()
+
+        vibrationSwitch.isEnabled = supported
+        if (supported) applyVibrationEnabledState(settings.enabled) else {
+            vibrationIntensitySeek.isEnabled = false
+            vibrationClickCheck.isEnabled = false
+            vibrationModeCheck.isEnabled = false
+            vibrationScreenshotCheck.isEnabled = false
+        }
+
+        vibrationSwitch.setOnCheckedChangeListener { _, checked ->
+            saveVibrationSettings()
+            applyVibrationEnabledState(checked)
+        }
+        vibrationIntensitySeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                updateVibrationLabels()
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                saveVibrationSettings()
+            }
+        })
+        val checkListener = CompoundButton.OnCheckedChangeListener { _, _ -> saveVibrationSettings() }
+        vibrationClickCheck.setOnCheckedChangeListener(checkListener)
+        vibrationModeCheck.setOnCheckedChangeListener(checkListener)
+        vibrationScreenshotCheck.setOnCheckedChangeListener(checkListener)
+    }
+
+    /** 总开关关闭时，强度与分项开关一并置灰（保留已保存值）。 */
+    private fun applyVibrationEnabledState(enabled: Boolean) {
+        val active = enabled && vibrationSwitch.isEnabled
+        vibrationIntensitySeek.isEnabled = active
+        vibrationClickCheck.isEnabled = active
+        vibrationModeCheck.isEnabled = active
+        vibrationScreenshotCheck.isEnabled = active
+    }
+
+    private fun saveVibrationSettings() {
+        settingsRepository.saveVibrationSettings(
+            VibrationSettings(
+                enabled = vibrationSwitch.isChecked,
+                intensity = selectedVibrationIntensity(),
+                clickEnabled = vibrationClickCheck.isChecked,
+                modeToggleEnabled = vibrationModeCheck.isChecked,
+                screenshotEnabled = vibrationScreenshotCheck.isChecked,
+            )
+        )
+        pushVibrationSettings()
+    }
+
+    /** 立即推给运行中的 MouseService，不重启服务、不重连手柄。 */
+    private fun pushVibrationSettings() {
+        if (!MouseService.isRunning) return
+        try {
+            startService(
+                Intent(this, MouseService::class.java)
+                    .setAction(MouseService.ACTION_UPDATE_VIBRATION)
+            )
+        } catch (_: Throwable) {
+            // 服务可能刚好停止；设置已持久化，下次启动生效。
+        }
+    }
+
+    private fun updateVibrationLabels() {
+        vibrationIntensityValue.text =
+            getString(R.string.vibration_intensity_value, selectedVibrationIntensity())
+    }
+
+    private fun selectedVibrationIntensity(): Int {
+        val steps = VibrationSettings.INTENSITY_STEPS
+        return steps[vibrationIntensitySeek.progress.coerceIn(0, steps.size - 1)]
+    }
+
+    private fun intensityIndex(intensity: Int): Int {
+        val steps = VibrationSettings.INTENSITY_STEPS
+        return steps.indexOf(intensity).takeIf { it >= 0 } ?: steps.lastIndex
     }
 
     // ---------------------------------------------------------------- 四、设置：按键绑定

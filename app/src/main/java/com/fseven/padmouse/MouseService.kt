@@ -6,18 +6,21 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -98,6 +101,9 @@ class MouseService : Service() {
     /** 长按判定：按下后延时触发，松开取消（短按不动作）。 */
     private val modeToggleRunnable = Runnable { toggleMouseMode() }
 
+    /** M11 震动设置缓存；设置页修改后经 ACTION_UPDATE_VIBRATION 立即生效。 */
+    private var vibrationSettings = VibrationSettings()
+
     /** 独占状态轮询；Binder 查询放到注入线程，避免阻塞主线程。 */
     private val exclusiveStatusPoller = object : Runnable {
         override fun run() {
@@ -110,7 +116,7 @@ class MouseService : Service() {
     private var windowAlphaAnimator: ValueAnimator? = null
 
     private val idleHideRunnable = Runnable {
-        // 静止超时：降低窗口 alpha（不是 View alpha），保留一个可感知的落点。
+        // 静止超时：窗口 alpha 归零（不是 View alpha），光标完全消失且不拦截触摸。
         animateWindowAlpha(IDLE_WINDOW_ALPHA, FADE_OUT_MS)
     }
 
@@ -145,6 +151,13 @@ class MouseService : Service() {
 
         override fun onAction(action: MapperAction, atMillis: Long) {
             MouseRuntime.setAction(action, atMillis)
+            // M11：点击震动（左键 / 右键），受分项开关控制。
+            when (action) {
+                MapperAction.TAP,
+                MapperAction.RIGHT_CLICK -> vibrateOnce(VibrationKind.CLICK)
+
+                else -> Unit
+            }
         }
     }
 
@@ -185,6 +198,39 @@ class MouseService : Service() {
             } else {
                 Log.w(TAG, "系统动作 " + action + " 失败: " + result.output)
             }
+            postSystemActionFeedback(action, result)
+        }
+    }
+
+    /** 系统动作结果反馈：截图成功/失败 Toast + 震动，亮度变化成功震动。 */
+    private fun postSystemActionFeedback(action: SystemAction, result: SystemActions.Result) {
+        handler.post {
+            when (action) {
+                SystemAction.SCREENSHOT -> {
+                    if (result.success) {
+                        vibrateOnce(VibrationKind.SCREENSHOT)
+                        Toast.makeText(
+                            this@MouseService,
+                            R.string.toast_screenshot_ok,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        val reason = result.failureReason
+                            ?: getString(R.string.toast_screenshot_failed_unknown)
+                        Toast.makeText(
+                            this@MouseService,
+                            getString(R.string.toast_screenshot_failed, reason),
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+
+                SystemAction.BRIGHTNESS_UP, SystemAction.BRIGHTNESS_DOWN -> {
+                    if (result.success) vibrateOnce(VibrationKind.BRIGHTNESS, VIBRATE_BRIGHTNESS_MS)
+                }
+
+                else -> Unit
+            }
         }
     }
 
@@ -194,6 +240,8 @@ class MouseService : Service() {
             if (type != EV_KEY) return
             MouseRuntime.addKeyEvent(code, value, SystemClock.uptimeMillis())
             handler.post {
+                // 任意按键事件都立即恢复光标可见（静止 3 秒后是完全透明）。
+                showCursorNow()
                 // 模式切换热键优先消费：游戏模式下映射已停，仍能靠这里切回。
                 if (handleModeToggleKey(code, value)) return@post
                 if (mapper.isRunning) mapper.onKey(code, value)
@@ -202,6 +250,8 @@ class MouseService : Service() {
 
         override fun onAxis(code: Int, normalized: Float) {
             handler.post {
+                // 摇杆/扳机/十字键任一轴事件都立即恢复光标可见。
+                showCursorNow()
                 MouseRuntime.updateAxes(code, normalized)
                 if (mapper.isRunning) mapper.onAxis(code, normalized)
             }
@@ -229,6 +279,7 @@ class MouseService : Service() {
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         settingsRepository = SettingsRepository(this)
+        vibrationSettings = settingsRepository.loadVibrationSettings()
         modeToggleBinding = settingsRepository.loadModeToggleBinding()
         systemActions = SystemActions { command -> serviceManager.shellExec(command) }
         createNotificationChannel()
@@ -256,6 +307,12 @@ class MouseService : Service() {
 
             ACTION_UPDATE_EXCLUSIVE -> {
                 applyExclusiveSetting()
+                return START_NOT_STICKY
+            }
+
+            ACTION_UPDATE_VIBRATION -> {
+                // 改动立即生效：重新读持久化设置，下次触发即使用新参数，无需重启服务/重连手柄。
+                vibrationSettings = settingsRepository.loadVibrationSettings()
                 return START_NOT_STICKY
             }
 
@@ -744,7 +801,8 @@ class MouseService : Service() {
         inGameMode = true
         savedCursorX = cursorX
         savedCursorY = cursorY
-        vibrateOnce()
+        // 切换动作发生时立即震动；后续 mapper.stop() 不会取消已提交的震动。
+        vibrateOnce(VibrationKind.MODE_TOGGLE)
         if (::mapper.isInitialized && mapper.isRunning) mapper.stop()
         MouseRuntime.mappingRunning = false
         // 只 ungrab，不关闭 fd：热键仍能读到来切回。
@@ -759,7 +817,7 @@ class MouseService : Service() {
     private fun leaveGameMode() {
         if (!inGameMode) return
         inGameMode = false
-        vibrateOnce()
+        vibrateOnce(VibrationKind.MODE_TOGGLE)
         runCatching { serviceManager.setMouseMode(true) }
         applyPosition(savedCursorX, savedCursorY, updateLayout = true)
         setOverlayVisible(true)
@@ -792,14 +850,56 @@ class MouseService : Service() {
         }
     }
 
-    private fun vibrateOnce() {
-        val vibrator = getSystemService(Vibrator::class.java) ?: return
-        if (!vibrator.hasVibrator()) return
-        runCatching {
-            vibrator.vibrate(
-                VibrationEffect.createOneShot(VIBRATE_MS, VibrationEffect.DEFAULT_AMPLITUDE)
-            )
+    /** M11 震动类型；对应设置页的分项开关。 */
+    private enum class VibrationKind { CLICK, MODE_TOGGLE, SCREENSHOT, BRIGHTNESS }
+
+    /**
+     * 按当前震动设置触发一次震动。
+     *
+     * - API 31+ 优先取 [VibratorManager.defaultVibrator]，为空/失败回退 [Vibrator] 服务；
+     * - 用 [VibrationEffect.createOneShot] + 强度 amplitude；
+     * - amplitude 不被支持时 try/catch 降级到 [Vibrator.vibrate]（long）。
+     */
+    private fun vibrateOnce(kind: VibrationKind, durationMs: Long = VIBRATE_MS) {
+        val settings = vibrationSettings
+        if (!settings.enabled || settings.amplitude <= 0) return
+        val allowed = when (kind) {
+            VibrationKind.CLICK -> settings.clickEnabled
+            VibrationKind.MODE_TOGGLE -> settings.modeToggleEnabled
+            VibrationKind.SCREENSHOT -> settings.screenshotEnabled
+            // 亮度反馈是可选提示，只受总开关/强度控制。
+            VibrationKind.BRIGHTNESS -> true
         }
+        if (!allowed) return
+
+        val vibrator = resolveVibrator()
+        if (vibrator == null || !vibrator.hasVibrator()) {
+            Log.w(TAG_VIBRATE, "没有可用的震动马达，跳过 " + kind)
+            return
+        }
+        val amplitude = settings.amplitude.coerceIn(1, VibrationEffect.DEFAULT_AMPLITUDE)
+        try {
+            vibrator.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
+        } catch (t: Throwable) {
+            Log.w(TAG_VIBRATE, "amplitude 震动失败，降级到 vibrate(long)", t)
+            try {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(durationMs)
+            } catch (t2: Throwable) {
+                Log.w(TAG_VIBRATE, "震动失败", t2)
+            }
+        }
+    }
+
+    /** API 31+ 用 VibratorManager.defaultVibrator，失败/为空回退 Vibrator 服务。 */
+    private fun resolveVibrator(): Vibrator? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val manager = runCatching { getSystemService(VibratorManager::class.java) }.getOrNull()
+            val default = runCatching { manager?.defaultVibrator }.getOrNull()
+            if (default != null) return default
+            Log.w(TAG_VIBRATE, "VibratorManager.defaultVibrator 为空，回退 Vibrator 服务")
+        }
+        return runCatching { getSystemService(Vibrator::class.java) }.getOrNull()
     }
 
     /** 拉取独占状态（Binder 调用放注入线程），界面据此显示「独占中/旁听中/独占失败」。 */
@@ -928,6 +1028,7 @@ class MouseService : Service() {
         const val ACTION_UPDATE = "com.fseven.padmouse.action.UPDATE_CURSOR"
         const val ACTION_UPDATE_CONFIG = "com.fseven.padmouse.action.UPDATE_CONFIG"
         const val ACTION_UPDATE_EXCLUSIVE = "com.fseven.padmouse.action.UPDATE_EXCLUSIVE"
+        const val ACTION_UPDATE_VIBRATION = "com.fseven.padmouse.action.UPDATE_VIBRATION"
         const val ACTION_STOP = "com.fseven.padmouse.action.STOP_CURSOR"
 
         const val EXTRA_SIZE_DP = "extra_size_dp"
@@ -954,7 +1055,9 @@ class MouseService : Service() {
 
         /** 激活态窗口透明度必须 <= 0.8，否则 Android 12+ 会拦截穿透触摸。 */
         private const val ACTIVE_WINDOW_ALPHA = 0.79f
-        private const val IDLE_WINDOW_ALPHA = 0.15f
+
+        /** M11：静止后窗口完全透明（不是 View alpha），用户要求直接消失。 */
+        private const val IDLE_WINDOW_ALPHA = 0f
         private const val FADE_IN_MS = 120L
         private const val FADE_OUT_MS = 200L
         private const val PERMISSION_CHECK_INTERVAL_MS = 2000L
@@ -964,7 +1067,30 @@ class MouseService : Service() {
         private const val REBIND_DELAY_MS = 1000L
         private const val MAX_REBIND_ATTEMPTS = 5
         private const val EXCLUSIVE_POLL_MS = 1_500L
-        private const val VIBRATE_MS = 60L
+
+        /** 震动日志统一用 TAG=Vibrator，方便真机排查。 */
+        private const val TAG_VIBRATE = "Vibrator"
+
+        /** M11：60ms 太短，真机几乎无感；180ms 才能明显感到。 */
+        private const val VIBRATE_MS = 180L
+        private const val VIBRATE_BRIGHTNESS_MS = 40L
+
+        /**
+         * 震动能力查询：设置页据此决定是否置灰「手柄震动」区块。
+         * API 31+ 先看 VibratorManager.defaultVibrator，失败回退 Vibrator 服务。
+         */
+        fun isVibrationSupported(context: Context): Boolean {
+            val fromManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                runCatching {
+                    context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+                }.getOrNull()
+            } else {
+                null
+            }
+            val vibrator = fromManager
+                ?: runCatching { context.getSystemService(Vibrator::class.java) }.getOrNull()
+            return vibrator?.hasVibrator() == true
+        }
 
         /** 服务/光标是否在运行，供主界面同步开关状态。 */
         @Volatile

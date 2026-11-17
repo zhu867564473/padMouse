@@ -3,6 +3,34 @@ package com.fseven.padmouse
 import android.content.Context
 
 /**
+ * M11 震动反馈设置。
+ *
+ * @param enabled 总开关
+ * @param intensity 强度百分比（0 / 25 / 50 / 75 / 100）；0 等价关闭
+ * @param clickEnabled 点击震动（左键 / 右键）
+ * @param modeToggleEnabled 模式切换震动
+ * @param screenshotEnabled 截图震动
+ */
+data class VibrationSettings(
+    val enabled: Boolean = true,
+    val intensity: Int = 100,
+    val clickEnabled: Boolean = true,
+    val modeToggleEnabled: Boolean = true,
+    val screenshotEnabled: Boolean = true,
+) {
+    /** VibrationEffect amplitude（0..255）；0 表示不震。 */
+    val amplitude: Int
+        get() = (MAX_AMPLITUDE * intensity / 100).coerceIn(0, MAX_AMPLITUDE)
+
+    companion object {
+        const val MAX_AMPLITUDE = 255
+
+        /** 滑杆 0..4 档对应的百分比。 */
+        val INTENSITY_STEPS = intArrayOf(0, 25, 50, 75, 100)
+    }
+}
+
+/**
  * M7 设置持久化：光标外观、手感参数、按键绑定统一写入 SharedPreferences。
  *
  * 所有读取都带默认值与范围钳制，旧版本数据损坏或缺失时不会出现空配置；
@@ -66,6 +94,26 @@ class SettingsRepository(context: Context) {
     fun saveModeToggleBinding(binding: ActionBinding) {
         if (binding.direction != 0 || binding.isChord) return
         prefs.edit().putString(KEY_MODE_TOGGLE, binding.encode()).apply()
+    }
+
+    // ---------------------------------------------------------------- M11 震动反馈
+
+    fun loadVibrationSettings(): VibrationSettings = VibrationSettings(
+        enabled = prefs.getBoolean(KEY_VIBRATION_ENABLED, true),
+        intensity = prefs.getInt(KEY_VIBRATION_INTENSITY, 100).coerceIn(0, 100),
+        clickEnabled = prefs.getBoolean(KEY_VIBRATION_CLICK, true),
+        modeToggleEnabled = prefs.getBoolean(KEY_VIBRATION_MODE_TOGGLE, true),
+        screenshotEnabled = prefs.getBoolean(KEY_VIBRATION_SCREENSHOT, true),
+    )
+
+    fun saveVibrationSettings(settings: VibrationSettings) {
+        prefs.edit()
+            .putBoolean(KEY_VIBRATION_ENABLED, settings.enabled)
+            .putInt(KEY_VIBRATION_INTENSITY, settings.intensity.coerceIn(0, 100))
+            .putBoolean(KEY_VIBRATION_CLICK, settings.clickEnabled)
+            .putBoolean(KEY_VIBRATION_MODE_TOGGLE, settings.modeToggleEnabled)
+            .putBoolean(KEY_VIBRATION_SCREENSHOT, settings.screenshotEnabled)
+            .apply()
     }
 
     // ---------------------------------------------------------------- 手感参数
@@ -202,6 +250,13 @@ class SettingsRepository(context: Context) {
         private const val KEY_EXCLUSIVE_MODE = "gamepad_exclusive_mode"
         private const val KEY_MODE_TOGGLE = "gamepad_mode_toggle_binding"
         private const val KEY_MODE_TOGGLE_MIGRATED = "gamepad_mode_toggle_migrated_v1"
+
+        // M11 震动反馈
+        private const val KEY_VIBRATION_ENABLED = "vibration_enabled"
+        private const val KEY_VIBRATION_INTENSITY = "vibration_intensity"
+        private const val KEY_VIBRATION_CLICK = "vibration_click"
+        private const val KEY_VIBRATION_MODE_TOGGLE = "vibration_mode_toggle"
+        private const val KEY_VIBRATION_SCREENSHOT = "vibration_screenshot"
 
         // ---------------------------------------------------------------- M10 默认绑定
 

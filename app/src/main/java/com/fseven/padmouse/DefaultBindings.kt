@@ -35,8 +35,11 @@ object DefaultBindings {
     /**
      * 组合键判定窗口：参与组合的键按下后先等这么久，
      * 期间组合成立则只触发组合动作，否则补发单键动作。
+     *
+     * M11：90ms 对真人拇指来说太严，放宽到 250ms；组合判定不要求两键
+     * 同时落下，先按住的键会一直参与判定（见 Mapper 的 heldKeys）。
      */
-    const val CHORD_GRACE_MS = 90L
+    const val CHORD_GRACE_MS = 250L
 
     const val MOVE_AXIS_X = GamepadAxes.ABS_X
     const val MOVE_AXIS_Y = GamepadAxes.ABS_Y
@@ -64,6 +67,16 @@ object DefaultBindings {
     const val BTN_DPAD_DOWN = 0x221
     const val BTN_DPAD_LEFT = 0x222
     const val BTN_DPAD_RIGHT = 0x223
+
+    /**
+     * 十字键上报方式的别名：部分手柄上报 EV_KEY + BTN_DPAD_UP/DOWN，
+     * 另一些上报 EV_ABS + ABS_HAT0Y。这里把按键映射到等价的（轴 code, 方向），
+     * 让同一份「十字键上/下 → 亮度」绑定同时兼容两种设备。
+     */
+    val DPAD_KEY_AXIS_ALIAS: Map<Int, Pair<Int, Int>> = mapOf(
+        BTN_DPAD_UP to (AXIS_HAT0Y to -1),
+        BTN_DPAD_DOWN to (AXIS_HAT0Y to 1),
+    )
 
     /** 按键 → 鼠标动作。 */
     val BUTTON_ACTIONS: Map<Int, MouseAction> = linkedMapOf(

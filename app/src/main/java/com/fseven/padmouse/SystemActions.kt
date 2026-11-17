@@ -84,12 +84,15 @@ class SystemActions(private val shell: (String) -> String) {
         val commands: List<String>,
         val success: Boolean,
         val output: String,
+        /** 失败原因（供界面/Toast 提示）；成功时为 null。 */
+        val failureReason: String? = null,
     )
 
     fun run(action: SystemAction): Result {
         val commands = ArrayList<String>()
         val output = StringBuilder()
         var failed = false
+        var failureReason: String? = null
 
         val exec: (String) -> String = { cmd ->
             commands.add(cmd)
@@ -114,13 +117,27 @@ class SystemActions(private val shell: (String) -> String) {
             SystemAction.VOLUME_DOWN -> exec(CMD_VOLUME_DOWN)
             SystemAction.BRIGHTNESS_UP -> adjustBrightness(BRIGHTNESS_STEP, exec)
             SystemAction.BRIGHTNESS_DOWN -> adjustBrightness(-BRIGHTNESS_STEP, exec)
-            SystemAction.SCREENSHOT -> takeScreenshot(exec)
+            SystemAction.SCREENSHOT -> {
+                val reason = takeScreenshot(exec)
+                if (reason != null) {
+                    failed = true
+                    failureReason = reason
+                    if (output.isNotEmpty()) output.append('\n')
+                    output.append(reason)
+                } else {
+                    // 文件已存在且非空即视为截图成功；媒体扫描失败的 ERROR 不再翻盘。
+                    failed = false
+                }
+            }
         }
 
-        return Result(action, commands.toList(), !failed, output.toString().trim())
+        return Result(action, commands.toList(), !failed, output.toString().trim(), failureReason)
     }
 
-    /** 先切手动亮度，再读当前值 ±[delta]，钳制 0..255 后写回。 */
+    /**
+     * 先切手动亮度，再读当前值 ±[delta]，钳制 0..255 后写回。
+     * 读值失败（空/null/权限）时回退 [DEFAULT_BRIGHTNESS]，不会让整条链路失败。
+     */
     private fun adjustBrightness(delta: Int, exec: (String) -> String) {
         exec(CMD_BRIGHTNESS_MODE_MANUAL)
         val current = parseBrightness(exec(CMD_BRIGHTNESS_GET))
@@ -128,17 +145,42 @@ class SystemActions(private val shell: (String) -> String) {
         exec(cmdSetBrightness(target))
     }
 
-    /** screencap 落盘后再发媒体扫描广播，让相册立即可见。 */
-    private fun takeScreenshot(exec: (String) -> String) {
-        exec(CMD_MKDIR_SCREENSHOTS)
+    /**
+     * screencap 落盘后先确认文件存在且非空，再发媒体扫描广播让相册立即可见。
+     *
+     * @return null 表示成功；否则返回可直接展示给用户的失败原因。
+     */
+    private fun takeScreenshot(exec: (String) -> String): String? {
+        val mkdir = exec(CMD_MKDIR_SCREENSHOTS)
+        if (isErrorOutput(mkdir)) {
+            val detail = mkdir.lineSequence().lastOrNull { it.isNotBlank() }?.take(160)
+            return if (detail.isNullOrBlank()) "无法创建截图目录" else "无法创建截图目录：$detail"
+        }
         val path = screenshotPath(System.currentTimeMillis())
-        exec(cmdScreencap(path))
-        exec(cmdMediaScan(path))
+        val capture = exec(cmdScreencap(path))
+        if (isErrorOutput(capture)) {
+            val detail = capture.lineSequence().lastOrNull { it.isNotBlank() }?.take(160)
+            return if (detail.isNullOrBlank()) "screencap 执行失败" else "screencap 执行失败：$detail"
+        }
+        val check = exec(cmdCheckScreenshot(path)).trim()
+        return when {
+            check.contains(FILE_OK) -> {
+                exec(cmdMediaScan(path))
+                null
+            }
+
+            check.contains(FILE_EMPTY) -> "截图文件为空（$path）"
+            else -> "截图文件不存在（$path）"
+        }
     }
 
+    /** 读取亮度：跳过空行与 "null" 等非数字输出，取最后一个合法整数。 */
     private fun parseBrightness(output: String): Int {
-        val line = output.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() }
-        return line?.toIntOrNull()?.coerceIn(BRIGHTNESS_MIN, BRIGHTNESS_MAX) ?: DEFAULT_BRIGHTNESS
+        val value = output.lineSequence()
+            .map { it.trim() }
+            .lastOrNull { it.toIntOrNull() != null }
+            ?.toIntOrNull()
+        return value?.coerceIn(BRIGHTNESS_MIN, BRIGHTNESS_MAX) ?: DEFAULT_BRIGHTNESS
     }
 
     /** shellExec 失败时返回 "ERROR..." 或追加 "ERROR: exit=N"。 */
@@ -166,6 +208,9 @@ class SystemActions(private val shell: (String) -> String) {
         const val MEDIA_SCAN_ACTION = "android.intent.action.MEDIA_SCANNER_SCAN_FILE"
         const val CMD_MKDIR_SCREENSHOTS = "mkdir -p $SCREENSHOT_DIR"
 
+        private const val FILE_OK = "PM_FILE_OK"
+        private const val FILE_EMPTY = "PM_FILE_EMPTY"
+
         fun cmdSetBrightness(value: Int): String =
             "settings put system screen_brightness $value"
 
@@ -173,6 +218,11 @@ class SystemActions(private val shell: (String) -> String) {
             "$SCREENSHOT_DIR/$SCREENSHOT_FILE_PREFIX$timestampMs.png"
 
         fun cmdScreencap(path: String): String = "screencap -p $path"
+
+        /** 校验截图结果：非空 / 存在但为空 / 不存在。 */
+        fun cmdCheckScreenshot(path: String): String =
+            "if [ -s $path ]; then echo PM_FILE_OK; " +
+                "elif [ -f $path ]; then echo PM_FILE_EMPTY; else echo PM_FILE_MISSING; fi"
 
         fun cmdMediaScan(path: String): String =
             "am broadcast -a $MEDIA_SCAN_ACTION -d file://$path"

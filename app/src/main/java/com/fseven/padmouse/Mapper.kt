@@ -337,8 +337,23 @@ class Mapper(
     private fun participatesInChord(code: Int): Boolean =
         config.systemBindings.values.any { it.isChord && it.involvesKey(code) }
 
-    private fun systemBindingForKey(code: Int): Map.Entry<SystemAction, ActionBinding>? =
+    /**
+     * 按键查找系统动作绑定。
+     *
+     * 除了直接匹配（如 Select → Back），还会把「十字键按键」别名到等价的
+     * 数字轴绑定（BTN_DPAD_UP → ABS_HAT0Y -1），这样同一份亮度绑定
+     * 在轴上报/键上报两种手柄上都能生效。
+     */
+    private fun systemBindingForKey(code: Int): Map.Entry<SystemAction, ActionBinding>? {
         config.systemBindings.entries.firstOrNull { (_, binding) -> binding.matchesKey(code) }
+            ?.let { return it }
+        val alias = DefaultBindings.DPAD_KEY_AXIS_ALIAS[code] ?: return null
+        val axisCode = alias.first
+        val direction = alias.second
+        return config.systemBindings.entries.firstOrNull { (_, binding) ->
+            binding.direction == direction && binding.code == axisCode
+        }
+    }
 
     /** 触发系统动作；同一动作 200ms 内只执行一次。 */
     private fun triggerSystem(action: SystemAction) {
