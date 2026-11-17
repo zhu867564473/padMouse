@@ -3,7 +3,6 @@ package com.fseven.padmouse
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.view.Choreographer
 import android.view.MotionEvent
 import kotlin.math.hypot
 import kotlin.math.pow
@@ -76,7 +75,7 @@ data class MapperConfig(
 /**
  * M5 映射引擎（App 侧）。
  *
- * 以 [Choreographer] 按屏幕刷新率（通常 60Hz）驱动：
+ * 以 [Handler] 按固定 60Hz tick 驱动（不依赖 Activity 的 UI 帧，前台/后台持续运行）：
  * - 左摇杆（ABS_X/ABS_Y）→ 死区 + 加速曲线 → 光标位移 → [MouseService.moveTo]；
  * - 右摇杆纵向（ABS_RY）→ 每帧累积，满一格注入一次 scroll；
  * - 按键绑定 → tap / 右键 / 中键 / 滚轮 / 长按拖拽；
@@ -84,6 +83,7 @@ data class MapperConfig(
  *
  * 手柄事件由 UserService 的 GamepadReader 经 IGamepadListener 回传到 App 进程，
  * 本类只消费归一化数值，不直接读设备；必须在有 Looper 的线程（主线程）使用。
+ * 屏幕尺寸由宿主（[MouseService]）通过 WindowManager 读取后经 [start] 传入。
  */
 class Mapper(
     private val injector: Injector,
@@ -114,8 +114,6 @@ class Mapper(
         fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {}
         fun onAction(action: MapperAction, atMillis: Long) {}
     }
-
-    private val choreographer: Choreographer = Choreographer.getInstance()
 
     private var running = false
     private var lastFrameNanos = 0L
@@ -199,14 +197,14 @@ class Mapper(
 
         listener?.onCursor(cursorX, cursorY)
         listener?.onVector(0f, 0f, 0f, 0f)
-        choreographer.postFrameCallback(frameCallback)
+        handler.post(frameRunnable)
     }
 
     /** 停止驱动；若仍在拖拽/按住状态，先补发 up，避免按键卡住。 */
     fun stop() {
         if (!running) return
         running = false
-        choreographer.removeFrameCallback(frameCallback)
+        handler.removeCallbacks(frameRunnable)
         pendingKeyActions.values.forEach { handler.removeCallbacks(it) }
         pendingKeyActions.clear()
         heldKeys.clear()
@@ -436,17 +434,22 @@ class Mapper(
 
     // ---------------------------------------------------------------- 帧驱动
 
-    private val frameCallback = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
+    /**
+     * 固定 60Hz tick。前台服务的主线程即使没有界面帧也会持续收到 Handler 消息，
+     * 因此切到桌面/别的 App 后映射不会停摆。
+     */
+    private val frameRunnable = object : Runnable {
+        override fun run() {
             if (!running) return
+            val nowNanos = System.nanoTime()
             val dt = if (lastFrameNanos == 0L) {
                 0f
             } else {
-                ((frameTimeNanos - lastFrameNanos) / 1_000_000_000.0).toFloat().coerceIn(0f, MAX_FRAME_DT)
+                ((nowNanos - lastFrameNanos) / 1_000_000_000.0).toFloat().coerceIn(0f, MAX_FRAME_DT)
             }
-            lastFrameNanos = frameTimeNanos
+            lastFrameNanos = nowNanos
             step(dt, SystemClock.uptimeMillis())
-            if (running) choreographer.postFrameCallback(this)
+            if (running) handler.postDelayed(this, TICK_MS)
         }
     }
 
@@ -552,5 +555,8 @@ class Mapper(
     companion object {
         /** 单帧最大步长，避免卡顿/恢复后光标瞬移。 */
         private const val MAX_FRAME_DT = 0.1f
+
+        /** 60Hz tick；Handler 驱动，不依赖界面帧。 */
+        private const val TICK_MS = 16L
     }
 }

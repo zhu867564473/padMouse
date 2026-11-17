@@ -45,7 +45,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var shizukuManager: ShizukuManager
     private lateinit var serviceManager: ShizukuServiceManager
     private lateinit var settingsRepository: SettingsRepository
-    private lateinit var systemActions: SystemActions
 
     // 引导条
     private lateinit var onboardingBanner: MaterialCardView
@@ -112,48 +111,17 @@ class MainActivity : AppCompatActivity() {
     private val systemSpinners = LinkedHashMap<SystemAction, Spinner>()
     private var systemBindings: Map<SystemAction, ActionBinding> = DefaultBindings.SYSTEM_ACTIONS
 
-    private lateinit var mapper: Mapper
-
-    private var lastCursorX = 0f
-    private var lastCursorY = 0f
-    private var lastLeftX = 0f
-    private var lastLeftY = 0f
-    private var lastRightX = 0f
-    private var lastRightY = 0f
-    private var lastMapperAction: MapperAction? = null
-    private var lastMapperActionAt = 0L
-    private var mappingRenderScheduled = false
-    private var mappingStartAttempts = 0
-
     private var lastUserServiceState: UserServiceState? = null
     private var disconnectNotified = false
-    private var lastKnownRunState = false
-    private var rebindAttempt = 0
+    private var mappingRenderScheduled = false
 
-    /**
-     * Shizuku UserService 被杀（服务进程重启/系统回收）后自动重绑，
-     * 每秒一次、最多 [MAX_REBIND_ATTEMPTS] 次；binder 恢复时绑定管理器也会重建。
-     */
-    private val rebindRunnable = object : Runnable {
-        override fun run() {
-            if (isFinishing || isDestroyed) return
-            if (serviceManager.isReady) {
-                rebindAttempt = 0
-                return
-            }
-            if (rebindAttempt >= MAX_REBIND_ATTEMPTS) return
-            rebindAttempt++
-            serviceManager.bindNow()
-            if (!serviceManager.isReady && rebindAttempt < MAX_REBIND_ATTEMPTS) {
-                runStatusValue.postDelayed(this, REBIND_DELAY_MS)
-            }
-        }
-    }
+    /** 用户在「未授权」时点了启动：授权链路完成后自动继续启动。 */
+    private var startAfterGrant = false
 
     /** binder 调用与 shell 命令放到后台线程，避免阻塞 UI。 */
     private val injectExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    /** 运行状态轮询：服务从通知栏停止/被系统回收时同步大按钮与映射。 */
+    /** 运行状态轮询：服务被系统/通知栏停止时同步大按钮。 */
     private val runStatePoller = object : Runnable {
         override fun run() {
             if (isFinishing || isDestroyed) return
@@ -162,110 +130,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Mapper 注入实现：统一切到单线程执行，保证 down/move/up 顺序。 */
-    private val mapperInjector = object : Mapper.Injector {
-        override fun tap(x: Float, y: Float) = dispatchInjection { serviceManager.tap(x, y) }
-
-        override fun rightClick(x: Float, y: Float) = dispatchInjection { serviceManager.rightClick(x, y) }
-
-        override fun middleClick(x: Float, y: Float) = dispatchInjection { serviceManager.middleClick(x, y) }
-
-        override fun touchDown(x: Float, y: Float) = dispatchInjection { serviceManager.down(x, y) }
-
-        override fun touchMove(x: Float, y: Float) = dispatchInjection { serviceManager.move(x, y) }
-
-        override fun touchUp(x: Float, y: Float) = dispatchInjection { serviceManager.up(x, y) }
-
-        override fun mouseDown(x: Float, y: Float, button: Int) =
-            dispatchInjection { serviceManager.mouseDown(x, y, button) }
-
-        override fun mouseUp(x: Float, y: Float, button: Int) =
-            dispatchInjection { serviceManager.mouseUp(x, y, button) }
-
-        override fun mouseMove(x: Float, y: Float, buttonState: Int) =
-            dispatchInjection { serviceManager.mouseMove(x, y, buttonState) }
-
-        override fun scroll(x: Float, y: Float, h: Float, v: Float) =
-            dispatchInjection { serviceManager.scroll(x, y, h, v) }
-
-        override fun systemAction(action: SystemAction) = dispatchInjection {
-            if (!serviceManager.isReady) {
-                Log.w(TAG, "系统动作 $action 跳过：UserService 未就绪")
-                return@dispatchInjection
-            }
-            val result = systemActions.run(action)
-            if (result.success) {
-                Log.i(TAG, "系统动作 $action 完成: ${result.commands.joinToString("; ")}")
-            } else {
-                Log.w(TAG, "系统动作 $action 失败: ${result.output}")
-            }
+    /** 映射/手柄调试面板轮询：读取 [MouseRuntime] 快照，避免高频事件刷 UI。 */
+    private val mappingPoller = object : Runnable {
+        override fun run() {
+            if (isFinishing || isDestroyed) return
+            renderMappingStatus()
+            renderMappingPanel()
+            renderGamepadPanel()
+            mappingStatus.postDelayed(this, MAPPING_POLL_MS)
         }
     }
 
-    private val mapperListener = object : Mapper.Listener {
-        override fun onCursor(x: Float, y: Float) {
-            lastCursorX = x
-            lastCursorY = y
-            scheduleMappingRender()
-        }
-
-        override fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {
-            lastLeftX = leftX
-            lastLeftY = leftY
-            lastRightX = rightX
-            lastRightY = rightY
-            scheduleMappingRender()
-        }
-
-        override fun onAction(action: MapperAction, atMillis: Long) {
-            lastMapperAction = action
-            lastMapperActionAt = atMillis
+    /** 共享状态变更回调（主线程）：Service 是唯一写入方，界面只读。 */
+    private val runtimeListener: () -> Unit = {
+        if (!isFinishing && !isDestroyed) {
+            renderUserServiceState(MouseRuntime.userServiceState)
+            renderRunState()
             scheduleMappingRender()
         }
     }
 
     private val gamepadTimeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
-    private val gamepadKeyEvents = ArrayDeque<String>()
-    private val gamepadAxisValues = LinkedHashMap<Int, Float>()
-    private var gamepadCaptureStarted = false
-    private var axisRenderScheduled = false
-
-    /** shell 侧回传的手柄事件；oneway 回调可能来自 Binder 线程，统一切回 UI。 */
-    private val gamepadListener = object : IGamepadListener.Stub() {
-        override fun onEvent(type: Int, code: Int, value: Int) {
-            if (type != 1) return // EV_KEY
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                addGamepadKeyEvent(code, value)
-                if (::mapper.isInitialized) mapper.onKey(code, value)
-            }
-        }
-
-        override fun onAxis(code: Int, normalized: Float) {
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                gamepadAxisValues[code] = normalized
-                scheduleAxisRender()
-                // 调试面板的摇杆向量即使映射未启动也刷新。
-                when (code) {
-                    GamepadAxes.ABS_X -> lastLeftX = normalized
-                    GamepadAxes.ABS_Y -> lastLeftY = normalized
-                    GamepadAxes.ABS_RX -> lastRightX = normalized
-                    GamepadAxes.ABS_RY -> lastRightY = normalized
-                }
-                if (::mapper.isInitialized) mapper.onAxis(code, normalized)
-                scheduleMappingRender()
-            }
-        }
-
-        override fun onDeviceInfo(summary: String?) {
-            if (summary.isNullOrBlank()) return
-            runOnUiThread {
-                if (isFinishing || isDestroyed) return@runOnUiThread
-                gamepadSummary.text = summary
-            }
-        }
-    }
 
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
@@ -336,17 +221,11 @@ class MainActivity : AppCompatActivity() {
         feelExponentValue = findViewById(R.id.feel_exponent_value)
 
         settingsRepository = SettingsRepository(this)
-        systemActions = SystemActions { cmd -> serviceManager.shellExec(cmd) }
 
-        serviceManager = ShizukuServiceManager(this) { state ->
-            runOnUiThread { renderUserServiceState(state) }
-        }
+        // 与 MouseService 共用同一个 UserService 绑定管理器（daemon 复用，进程内单例）。
+        serviceManager = MouseRuntime.ensureManager(this)
         systemBindings = settingsRepository.loadSystemBindings()
-        mapper = Mapper(
-            mapperInjector,
-            settingsRepository.loadMapperConfig(systemBindings),
-            mapperListener,
-        )
+        MouseRuntime.addListener(runtimeListener)
 
         onboardingBanner.setOnClickListener { onboardingAction?.invoke() }
         refreshButton.setOnClickListener {
@@ -368,7 +247,7 @@ class MainActivity : AppCompatActivity() {
         setupFeelControls()
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
-        renderUserServiceState(UserServiceState.CONNECTING)
+        renderUserServiceState(MouseRuntime.userServiceState)
         serviceManager.start()
     }
 
@@ -379,8 +258,12 @@ class MainActivity : AppCompatActivity() {
         updatePermissionStatusUi()
         renderRunState()
         stopCursorIfOverlayRevoked()
+        serviceManager = MouseRuntime.ensureManager(this)
         serviceManager.bindNow()
-        syncMapper()
+        renderUserServiceState(MouseRuntime.userServiceState)
+        renderRunState()
+        renderMappingPanel()
+        renderGamepadPanel()
         renderOnboarding()
         // MouseService 启动时自检补开的界面提示（不弹 Toast 打扰）。
         val persistedNotice = MouseService.takePermissionNotice()
@@ -392,12 +275,23 @@ class MainActivity : AppCompatActivity() {
         }
         // 权限自愈：悬浮窗/通知被回收且 Shizuku 仍可用时自动补开。
         selfHealPermissions()
+        // 从系统设置返回：若正在等待权限补齐后启动，这里继续完成启动。
+        if (startAfterGrant && Settings.canDrawOverlays(this) &&
+            shizukuManager.getStatus() == ShizukuStatus.GRANTED
+        ) {
+            startAfterGrant = false
+            requestNotificationPermissionIfNeeded()
+            startCursorService()
+        }
         runStatusValue.removeCallbacks(runStatePoller)
         runStatusValue.postDelayed(runStatePoller, RUN_STATE_POLL_MS)
+        mappingStatus.removeCallbacks(mappingPoller)
+        mappingStatus.postDelayed(mappingPoller, MAPPING_POLL_MS)
     }
 
     override fun onPause() {
         runStatusValue.removeCallbacks(runStatePoller)
+        mappingStatus.removeCallbacks(mappingPoller)
         super.onPause()
     }
 
@@ -415,13 +309,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        gamepadCaptureStarted = false
         runStatusValue.removeCallbacks(runStatePoller)
-        runStatusValue.removeCallbacks(rebindRunnable)
-        if (::mapper.isInitialized) mapper.stop()
-        runCatching { serviceManager.stopGamepadCapture() }
+        mappingStatus.removeCallbacks(mappingPoller)
+        MouseRuntime.removeListener(runtimeListener)
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
-        serviceManager.stop()
+        // 不停止服务/映射/UserService：前台服务继续运行，退出界面与切后台都不受影响。
         injectExecutor.shutdownNow()
         super.onDestroy()
     }
@@ -513,20 +405,16 @@ class MainActivity : AppCompatActivity() {
         testTapButton.isEnabled = ready
         gamepadRefreshButton.isEnabled = ready
         if (ready) {
-            runStatusValue.removeCallbacks(rebindRunnable)
-            rebindAttempt = 0
-            startGamepadCaptureIfNeeded()
             if (disconnectNotified) {
                 disconnectNotified = false
                 Toast.makeText(this, R.string.shizuku_toast_reconnected, Toast.LENGTH_SHORT).show()
             }
-        } else {
-            gamepadCaptureStarted = false
-            if (state == UserServiceState.DISCONNECTED && wasReady && !disconnectNotified) {
-                disconnectNotified = true
-                Toast.makeText(this, R.string.shizuku_toast_reconnecting, Toast.LENGTH_LONG).show()
-                scheduleRebind()
-            }
+        } else if (state == UserServiceState.DISCONNECTED && wasReady &&
+            !disconnectNotified && MouseService.isRunning
+        ) {
+            // 重连由 MouseService 负责；只在实际运行中掉线时提示，主动停止不打扰。
+            disconnectNotified = true
+            Toast.makeText(this, R.string.shizuku_toast_reconnecting, Toast.LENGTH_LONG).show()
         }
         injectServiceStatus.setText(
             when (state) {
@@ -536,13 +424,6 @@ class MainActivity : AppCompatActivity() {
                 UserServiceState.FAILED -> R.string.inject_service_status_failed
             }
         )
-        syncMapper()
-    }
-
-    private fun scheduleRebind() {
-        runStatusValue.removeCallbacks(rebindRunnable)
-        rebindAttempt = 0
-        runStatusValue.postDelayed(rebindRunnable, REBIND_DELAY_MS)
     }
 
     private fun runSelfTest() {
@@ -627,12 +508,43 @@ class MainActivity : AppCompatActivity() {
 
     private fun setCursorEnabled(enabled: Boolean) {
         if (!enabled) {
-            stopCursorService(showToast = false)
+            startAfterGrant = false
+            stopCursorService()
             return
+        }
+        when (shizukuManager.getStatus()) {
+            ShizukuStatus.NOT_INSTALLED, ShizukuStatus.NOT_RUNNING -> {
+                Toast.makeText(this, R.string.run_toast_need_shizuku, Toast.LENGTH_LONG).show()
+                MouseRuntime.setStage(
+                    RunStage.FAILED,
+                    getString(R.string.run_detail_shizuku_unavailable)
+                )
+                renderStatus()
+                renderOnboarding()
+                return
+            }
+
+            ShizukuStatus.NOT_GRANTED -> {
+                // 单主开关的第一环：先发起授权，授权完成后自动继续启动。
+                startAfterGrant = true
+                Toast.makeText(this, R.string.run_toast_request_shizuku, Toast.LENGTH_LONG).show()
+                if (!shizukuManager.requestPermission(ShizukuManager.REQUEST_CODE_PERMISSION)) {
+                    startAfterGrant = false
+                    renderStatus()
+                    renderOnboarding()
+                }
+                return
+            }
+
+            ShizukuStatus.GRANTED -> Unit
         }
         if (!Settings.canDrawOverlays(this)) {
             Toast.makeText(this, R.string.cursor_toast_need_overlay, Toast.LENGTH_SHORT).show()
-            renderRunState()
+            MouseRuntime.setStage(
+                RunStage.FAILED,
+                getString(R.string.run_detail_overlay_missing)
+            )
+            startAfterGrant = true
             requestOverlayPermission()
             return
         }
@@ -640,7 +552,14 @@ class MainActivity : AppCompatActivity() {
         startCursorService()
     }
 
+    /**
+     * 单主开关：只负责启动前台服务。绑定 UserService、注册手柄监听、
+     * 启动映射全部由 [MouseService] 串起来，失败时通过 [MouseRuntime] 回传原因。
+     */
     private fun startCursorService() {
+        // 服务销毁时共享绑定会被释放；启动前重新确保拿到当前单例。
+        serviceManager = MouseRuntime.ensureManager(this)
+        MouseRuntime.setStage(RunStage.STARTING_SERVICE)
         val intent = Intent(this, MouseService::class.java)
             .setAction(MouseService.ACTION_START)
             .putExtra(MouseService.EXTRA_SIZE_DP, settingsRepository.loadCursorSizeDp())
@@ -651,25 +570,21 @@ class MainActivity : AppCompatActivity() {
             )
         try {
             ContextCompat.startForegroundService(this, intent)
-            // 服务启动是异步的；轮询等待光标真正显示后再启动映射。
-            mappingStartAttempts = 0
-            scheduleMapperStart()
             renderRunState()
-            runStatusValue.postDelayed({ renderRunState() }, START_STATE_REFRESH_MS)
         } catch (t: Throwable) {
+            Log.e(TAG, "启动手柄鼠标失败", t)
+            MouseRuntime.setStage(RunStage.FAILED, getString(R.string.run_detail_start_failed))
             Toast.makeText(this, R.string.cursor_toast_start_failed, Toast.LENGTH_SHORT).show()
             renderRunState()
         }
     }
 
-    private fun stopCursorService(showToast: Boolean) {
+    private fun stopCursorService(showToast: Boolean = false) {
         stopService(Intent(this, MouseService::class.java))
-        mappingStartAttempts = MAPPING_MAX_START_ATTEMPTS
-        if (::mapper.isInitialized) mapper.stop()
-        lastKnownRunState = false
+        MouseRuntime.setStage(RunStage.IDLE)
+        MouseRuntime.resetRunningState()
         renderRunState()
-        renderMappingStatus()
-        scheduleMappingRender()
+        renderMappingPanel()
         if (showToast) {
             Toast.makeText(this, R.string.cursor_toast_overlay_revoked, Toast.LENGTH_LONG).show()
         }
@@ -683,21 +598,28 @@ class MainActivity : AppCompatActivity() {
         updatePermissionStatusUi()
     }
 
-    /** 运行状态变化时同步大按钮文案，并在服务被外部停止时停掉映射。 */
+    /** 运行状态与大按钮文案；阶段文案来自 MouseService 的共享状态。 */
     private fun renderRunState() {
         val running = MouseService.isRunning
+        val stage = MouseRuntime.stage
+        val detail = MouseRuntime.stageDetail
+        val statusText = when {
+            stage == RunStage.FAILED ->
+                getString(R.string.run_status_failed, detail ?: "")
+
+            running && stage == RunStage.BINDING_SHIZUKU -> getString(R.string.run_status_binding)
+            running && stage == RunStage.READING_GAMEPAD ->
+                getString(R.string.run_status_reading_gamepad)
+
+            running && stage == RunStage.RUNNING -> getString(R.string.run_status_running)
+            stage == RunStage.STARTING_SERVICE -> getString(R.string.run_status_starting)
+            else -> getString(R.string.run_status_stopped)
+        }
         // 只在文案变化时 setText，轮询不产生多余重排。
-        val statusText =
-            getString(if (running) R.string.run_status_running else R.string.run_status_stopped)
         if (runStatusValue.text != statusText) runStatusValue.text = statusText
         val toggleText =
             getString(if (running) R.string.run_action_stop else R.string.run_action_start)
         if (runToggleButton.text != toggleText) runToggleButton.text = toggleText
-        if (running != lastKnownRunState) {
-            lastKnownRunState = running
-            syncMapper()
-            scheduleMappingRender()
-        }
     }
 
     /** Android 13+ 需要运行时授权才能展示前台服务通知（含「停止」action）。 */
@@ -800,6 +722,8 @@ class MainActivity : AppCompatActivity() {
     private fun beginAutoGrant(fromOneTap: Boolean) {
         if (autoGrantRunning) return
         if (shizukuManager.getStatus() != ShizukuStatus.GRANTED) return
+        // 服务停止会释放共享绑定；授权流程开始前重新确保单例。
+        serviceManager = MouseRuntime.ensureManager(this)
         autoGrantRunning = true
         if (fromOneTap) {
             autoGrantStartedByOneTap = true
@@ -904,11 +828,20 @@ class MainActivity : AppCompatActivity() {
         }
         updatePermissionStatusUi()
         renderOnboarding()
-        syncMapper()
+        renderRunState()
+        // 用户从主开关进入的授权链路：授权齐全后自动继续启动，无需再点一次。
+        if (startAfterGrant && Settings.canDrawOverlays(this) &&
+            shizukuManager.getStatus() == ShizukuStatus.GRANTED
+        ) {
+            startAfterGrant = false
+            requestNotificationPermissionIfNeeded()
+            startCursorService()
+        }
     }
 
     /** 一键流程中用户拒绝/取消 Shizuku 授权时复位按钮。 */
     private fun abortAutoGrant() {
+        startAfterGrant = false
         if (!autoGrantStartedByOneTap) return
         autoGrantRunning = false
         autoGrantStartedByOneTap = false
@@ -971,28 +904,12 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 三、手柄
 
-    private fun startGamepadCaptureIfNeeded() {
-        if (gamepadCaptureStarted || !serviceManager.isReady) return
-        gamepadKeyEvents.clear()
-        gamepadAxisValues.clear()
-        gamepadEvents.setText(R.string.gamepad_events_idle)
-        gamepadAxes.setText(R.string.gamepad_axes_idle)
-        gamepadSummary.setText(R.string.gamepad_summary_scanning)
-        try {
-            serviceManager.startGamepadCapture(gamepadListener)
-            gamepadCaptureStarted = true
-            refreshGamepadInfo()
-        } catch (_: Throwable) {
-            gamepadCaptureStarted = false
-        }
-    }
-
+    /** 手柄扫描由 MouseService 负责；这里只触发一次设备摘要查询。 */
     private fun refreshGamepadInfo() {
         if (!serviceManager.isReady) {
             Toast.makeText(this, R.string.gamepad_toast_not_ready, Toast.LENGTH_SHORT).show()
             return
         }
-        if (!gamepadCaptureStarted) startGamepadCaptureIfNeeded()
         gamepadSummary.setText(R.string.gamepad_summary_scanning)
         injectExecutor.execute {
             val text = try {
@@ -1007,33 +924,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun addGamepadKeyEvent(code: Int, value: Int) {
-        val time = gamepadTimeFormat.format(Date())
-        gamepadKeyEvents.addFirst(getString(R.string.gamepad_key_event, time, code, value))
-        while (gamepadKeyEvents.size > GAMEPAD_EVENT_LIMIT) gamepadKeyEvents.removeLast()
-        gamepadEvents.text = gamepadKeyEvents.joinToString("\n")
-    }
-
-    /** 摇杆事件高频，合并到约 20fps 再刷新 UI。 */
-    private fun scheduleAxisRender() {
-        if (axisRenderScheduled) return
-        axisRenderScheduled = true
-        gamepadAxes.postDelayed({
-            axisRenderScheduled = false
-            if (isFinishing || isDestroyed) return@postDelayed
-            renderAxes()
-        }, AXIS_RENDER_INTERVAL_MS)
-    }
-
-    private fun renderAxes() {
-        if (gamepadAxisValues.isEmpty()) return
-        val values = gamepadAxisValues.entries
-            .sortedBy { it.key }
-            .joinToString("   ") { (code, value) ->
+    /** 手柄调试面板：读取 MouseService 写入的快照。 */
+    private fun renderGamepadPanel() {
+        if (!::gamepadSummary.isInitialized) return
+        val summary = MouseRuntime.gamepadSummary
+        if (!summary.isNullOrBlank()) {
+            if (gamepadSummary.text != summary) gamepadSummary.text = summary
+        }
+        val axes = MouseRuntime.axesSnapshot().sortedBy { it.first }
+        gamepadAxes.text = if (axes.isEmpty()) {
+            getString(R.string.gamepad_axes_idle)
+        } else {
+            val values = axes.joinToString("   ") { (code, value) ->
                 val name = GamepadAxes.NAMES[code] ?: "code=0x${code.toString(16)}"
                 "$name=${String.format(Locale.US, "%.2f", value)}"
             }
-        gamepadAxes.text = getString(R.string.gamepad_axes_value, values)
+            getString(R.string.gamepad_axes_value, values)
+        }
+        val events = MouseRuntime.keyEventsSnapshot()
+        gamepadEvents.text = if (events.isEmpty()) {
+            getString(R.string.gamepad_events_idle)
+        } else {
+            events.joinToString("\n") { entry ->
+                getString(
+                    R.string.gamepad_key_event,
+                    gamepadTimeFormat.format(Date(entry.atMillis)),
+                    entry.code,
+                    entry.value
+                )
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 四、设置：光标外观
@@ -1204,17 +1124,15 @@ class MainActivity : AppCompatActivity() {
             getString(R.string.feel_exponent_value, selectedAccelExponent())
     }
 
-    /** 手感参数热更新到正在运行的映射引擎，不需要重启。 */
+    /** 手感参数热更新到正在运行的映射引擎（服务侧），不需要重启。 */
     private fun applyFeelConfig() {
-        if (!::mapper.isInitialized) return
-        mapper.updateConfig(
-            mapper.configSnapshot.copy(
-                speedPxPerSec = selectedSpeedPxPerSec(),
-                deadzone = selectedDeadzone(),
-                exponent = selectedAccelExponent(),
-            )
-        )
+        pushMapperConfig()
         renderMappingStatus()
+    }
+
+    /** 映射配置由 MouseService 持有；这里把最新设置推给服务。 */
+    private fun pushMapperConfig() {
+        MouseService.applyConfig(settingsRepository.loadMapperConfig(systemBindings))
     }
 
     // ---------------------------------------------------------------- 四、设置：按键绑定
@@ -1320,8 +1238,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applySystemBindings() {
-        if (!::mapper.isInitialized) return
-        mapper.updateConfig(mapper.configSnapshot.copy(systemBindings = systemBindings))
+        pushMapperConfig()
     }
 
     private fun systemActionLabelRes(action: SystemAction): Int = when (action) {
@@ -1335,40 +1252,15 @@ class MainActivity : AppCompatActivity() {
         SystemAction.SCREENSHOT -> R.string.system_action_screenshot
     }
 
-    // ---------------------------------------------------------------- M5 映射引擎
+    // ---------------------------------------------------------------- 映射状态（只读）
 
-    /** 光标服务冷启动可能超过一个延迟周期，未就绪时继续重试，直到上限。 */
-    private fun scheduleMapperStart() {
-        mappingStatus.postDelayed({
-            if (isFinishing || isDestroyed) return@postDelayed
-            syncMapper()
-            if (!mapper.isRunning && mappingStartAttempts < MAPPING_MAX_START_ATTEMPTS) {
-                mappingStartAttempts++
-                scheduleMapperStart()
-            }
-        }, MAPPING_START_DELAY_MS)
-    }
-
-    /** 光标服务与 UserService 都就绪时自动启动 60Hz 映射。 */
-    private fun syncMapper() {
-        if (!::mapper.isInitialized) return
-        val shouldRun = serviceManager.isReady && MouseService.isRunning
-        if (shouldRun && !mapper.isRunning) {
-            val bounds = windowManager.currentWindowMetrics.bounds
-            mapper.start(bounds.width(), bounds.height())
-        } else if (!shouldRun && mapper.isRunning) {
-            mapper.stop()
-        }
-        renderMappingStatus()
-        scheduleMappingRender()
-    }
-
+    /** 映射运行在 MouseService 内；这里只做状态展示。 */
     private fun renderMappingStatus() {
-        if (!::mapper.isInitialized || !mapper.isRunning) {
+        if (!MouseRuntime.mappingRunning) {
             mappingStatus.setText(R.string.mapping_status_idle)
             return
         }
-        val config = mapper.configSnapshot
+        val config = MouseRuntime.mapperConfig ?: MapperConfig()
         mappingStatus.text = getString(
             R.string.mapping_status_running,
             config.deadzone,
@@ -1384,28 +1276,33 @@ class MainActivity : AppCompatActivity() {
             mappingRenderScheduled = false
             if (isFinishing || isDestroyed) return@postDelayed
             renderMappingPanel()
+            renderGamepadPanel()
         }, MAPPING_RENDER_INTERVAL_MS)
     }
 
     private fun renderMappingPanel() {
-        val running = ::mapper.isInitialized && mapper.isRunning
+        if (!::mappingCursorValue.isInitialized) return
+        val running = MouseRuntime.mappingRunning
         mappingCursorValue.text = if (running) {
-            getString(R.string.mapping_cursor_value, lastCursorX, lastCursorY)
+            getString(R.string.mapping_cursor_value, MouseRuntime.cursorX, MouseRuntime.cursorY)
         } else {
             getString(R.string.mapping_cursor_idle)
         }
         mappingVectorValue.text = getString(
             R.string.mapping_vector_value,
-            lastLeftX, lastLeftY, lastRightX, lastRightY
+            MouseRuntime.leftX,
+            MouseRuntime.leftY,
+            MouseRuntime.rightX,
+            MouseRuntime.rightY
         )
-        val action = lastMapperAction
+        val action = MouseRuntime.lastAction
         mappingActionValue.text = if (action == null) {
             getString(R.string.mapping_action_idle)
         } else {
             getString(
                 R.string.mapping_action_value,
                 getString(actionLabelRes(action)),
-                gamepadTimeFormat.format(Date(lastMapperActionAt))
+                gamepadTimeFormat.format(Date(MouseRuntime.lastActionAt))
             )
         }
     }
@@ -1432,27 +1329,11 @@ class MainActivity : AppCompatActivity() {
         MapperAction.SYSTEM_SCREENSHOT -> R.string.system_action_screenshot
     }
 
-    private fun dispatchInjection(block: () -> Unit) {
-        injectExecutor.execute {
-            try {
-                block()
-            } catch (t: Throwable) {
-                Log.w(TAG, "映射注入失败", t)
-            }
-        }
-    }
-
     companion object {
         private const val TAG = "MainActivity"
-        private const val GAMEPAD_EVENT_LIMIT = 10
-        private const val AXIS_RENDER_INTERVAL_MS = 50L
         private const val MAPPING_RENDER_INTERVAL_MS = 50L
-        private const val MAPPING_START_DELAY_MS = 400L
-        private const val MAPPING_MAX_START_ATTEMPTS = 8
+        private const val MAPPING_POLL_MS = 100L
         private const val RUN_STATE_POLL_MS = 1000L
-        private const val START_STATE_REFRESH_MS = 300L
-        private const val REBIND_DELAY_MS = 1000L
-        private const val MAX_REBIND_ATTEMPTS = 5
         private const val REQUEST_NOTIFICATIONS = 1001
         private const val USER_SERVICE_WAIT_MS = 4000L
         private const val USER_SERVICE_POLL_MS = 100L

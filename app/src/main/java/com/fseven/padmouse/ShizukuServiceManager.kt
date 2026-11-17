@@ -5,27 +5,36 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.util.Log
 import rikka.shizuku.Shizuku
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * App 侧 Shizuku UserService 绑定管理。
+ * App 侧 Shizuku UserService 绑定管理（进程内单例，由 [MouseRuntime] 持有）。
  *
- * 只负责绑定/解绑与状态回调；具体注入能力在 [PadMouseUserService]。
+ * - 使用 daemon UserService：进程常驻，反复绑定不会每次新建 shell 进程；
+ * - Activity 与 MouseService 共用同一个绑定，避免重复连接；
+ * - 解绑统一走 [unbindNow]（remove=false，保留 daemon 进程供复用）。
  */
 class ShizukuServiceManager(
     context: Context,
-    private val onStateChanged: (UserServiceState) -> Unit,
 ) {
 
     private val appContext: Context = context.applicationContext
     private var service: IPadMouse? = null
     private var bound = false
 
+    @Volatile
+    private var started = false
+
+    private val listeners = CopyOnWriteArrayList<(UserServiceState) -> Unit>()
+
     private val userServiceArgs: Shizuku.UserServiceArgs =
         Shizuku.UserServiceArgs(
             ComponentName(appContext.packageName, PadMouseUserService::class.java.name)
         )
-            .daemon(false)
+            // daemon 复用：进程常驻，重复 bind 不会累积 :input 进程。
+            .daemon(true)
             .processNameSuffix("input")
             .debuggable(BuildConfig.DEBUG)
             .version(BuildConfig.VERSION_CODE)
@@ -34,13 +43,13 @@ class ShizukuServiceManager(
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             bound = true
             service = binder?.let { IPadMouse.Stub.asInterface(it) }
-            onStateChanged(if (service != null) UserServiceState.READY else UserServiceState.FAILED)
+            notifyState(if (service != null) UserServiceState.READY else UserServiceState.FAILED)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
             service = null
-            onStateChanged(UserServiceState.DISCONNECTED)
+            notifyState(UserServiceState.DISCONNECTED)
         }
     }
 
@@ -51,24 +60,44 @@ class ShizukuServiceManager(
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         bound = false
         service = null
-        onStateChanged(UserServiceState.DISCONNECTED)
+        notifyState(UserServiceState.DISCONNECTED)
     }
 
-    /** 注册 Shizuku binder 监听并尝试立即绑定。 */
+    fun addListener(listener: (UserServiceState) -> Unit) {
+        listeners.add(listener)
+    }
+
+    fun removeListener(listener: (UserServiceState) -> Unit) {
+        listeners.remove(listener)
+    }
+
+    private fun notifyState(state: UserServiceState) {
+        for (listener in listeners) {
+            runCatching { listener(state) }
+        }
+    }
+
+    /** 注册 Shizuku binder 监听并尝试立即绑定；重复调用无副作用。 */
     fun start() {
-        Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
-        Shizuku.addBinderDeadListener(binderDeadListener)
+        if (started) {
+            bindNow()
+            return
+        }
+        started = true
+        runCatching { Shizuku.addBinderReceivedListenerSticky(binderReceivedListener) }
+        runCatching { Shizuku.addBinderDeadListener(binderDeadListener) }
         bindNow()
     }
 
-    /** 解绑并移除监听，Activity 销毁时调用。 */
+    /** 解绑并移除监听。daemon 进程不会因此被杀，下次启动可直接复用。 */
     fun stop() {
+        started = false
         runCatching { Shizuku.removeBinderReceivedListener(binderReceivedListener) }
         runCatching { Shizuku.removeBinderDeadListener(binderDeadListener) }
         unbindNow()
     }
 
-    /** 在权限已授予的前提下绑定 UserService。 */
+    /** 在权限已授予的前提下绑定 UserService；失败路径也保证连接状态被清理。 */
     fun bindNow() {
         if (bound) return
         try {
@@ -76,18 +105,26 @@ class ShizukuServiceManager(
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) return
             Shizuku.bindUserService(userServiceArgs, connection)
         } catch (t: Throwable) {
-            onStateChanged(UserServiceState.FAILED)
+            Log.w(TAG, "绑定 UserService 失败", t)
+            // 异常路径也要解绑，避免留下半连接状态。
+            runCatching { Shizuku.unbindUserService(userServiceArgs, connection, false) }
+            bound = false
+            service = null
+            notifyState(UserServiceState.FAILED)
         }
     }
 
     fun unbindNow() {
         try {
-            if (bound) Shizuku.unbindUserService(userServiceArgs, connection, true)
-        } catch (_: Throwable) {
-            // 已断开时忽略。
+            // remove=false：保留 daemon 进程，重复启动复用同一个 :input 进程。
+            Shizuku.unbindUserService(userServiceArgs, connection, false)
+        } catch (t: Throwable) {
+            Log.d(TAG, "解绑 UserService 失败（可能已断开）", t)
+        } finally {
+            bound = false
+            service = null
+            notifyState(UserServiceState.DISCONNECTED)
         }
-        bound = false
-        service = null
     }
 
     val isReady: Boolean
@@ -127,6 +164,10 @@ class ShizukuServiceManager(
 
     private fun requireService(): IPadMouse =
         service ?: throw IllegalStateException("UserService 未连接，请先完成 Shizuku 授权")
+
+    private companion object {
+        private const val TAG = "ShizukuServiceManager"
+    }
 }
 
 /** UserService 连接状态。 */
