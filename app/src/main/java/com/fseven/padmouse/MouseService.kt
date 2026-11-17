@@ -389,6 +389,9 @@ class MouseService : Service() {
     private fun startGamepadCapture(): Boolean {
         if (gamepadCaptureStarted) return true
         return try {
+            // UserService 是 shell uid 的 app_process，java.library.path 不含 APK lib 目录，
+            // 先把它自己的 nativeLibraryDir 传过去，供显式 System.load 原生 ioctl 库。
+            runCatching { serviceManager.setNativeLibraryDir(applicationInfo.nativeLibraryDir ?: "") }
             // 先下发独占开关：UserService 用该配置创建读取器（打开即 EVIOCGRAB）。
             runCatching { serviceManager.setExclusiveMode(settingsRepository.loadExclusiveMode()) }
             modeToggleBinding = settingsRepository.loadModeToggleBinding()

@@ -12,7 +12,6 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
-import java.util.zip.ZipFile
 
 /**
  * 在 UserService（Shizuku shell uid）进程内读取手柄原始输入。
@@ -26,6 +25,8 @@ class GamepadReader(
     exclusive: Boolean = true,
     /** 鼠标模式 = 独占 + 映射；游戏模式 = 释放抓取但 fd 保持打开（热键仍可读）。 */
     mouseMode: Boolean = true,
+    /** App 的 nativeLibraryDir，供 UserService 显式 System.load 原生库。 */
+    private val nativeLibDir: String? = null,
 ) {
 
     private val scanLock = Any()
@@ -184,7 +185,7 @@ class GamepadReader(
             }
             for (device in gamepads) {
                 if (!sessions.containsKey(device.path)) {
-                    val session = DeviceSession(device)
+                    val session = DeviceSession(device, nativeLibDir)
                     sessions[device.path] = session
                     toStart.add(session)
                 }
@@ -434,7 +435,7 @@ class GamepadReader(
 
     // ---------------- 会话与描述结构 ----------------
 
-    private class DeviceSession(initial: DeviceDescriptor) {
+    private class DeviceSession(initial: DeviceDescriptor, private val nativeLibDir: String?) {
         @Volatile var info: DeviceDescriptor = initial
         val path: String = initial.path
         var stream: FileInputStream? = null
@@ -472,7 +473,7 @@ class GamepadReader(
             if (grabbed) return null
             val fd = osFd ?: return "设备未打开"
             return try {
-                val result = evIoctlInt(fd, EVIOCGRAB, 1)
+                val result = evIoctlInt(fd, EVIOCGRAB, 1, nativeLibDir)
                 if (result == 0) {
                     grabbed = true
                     null
@@ -496,7 +497,7 @@ class GamepadReader(
             if (!grabbed) return true
             val fd = osFd ?: return false
             return try {
-                val result = evIoctlInt(fd, EVIOCGRAB, 0)
+                val result = evIoctlInt(fd, EVIOCGRAB, 0, nativeLibDir)
                 if (result == 0) {
                     grabbed = false
                     true
@@ -621,139 +622,27 @@ class GamepadReader(
          * 这里在运行时枚举可用签名并逐个尝试，全部不可用时抛出「已发现签名」清单，
          * 由 [DeviceSession.grab] 转成界面上可见的失败原因。
          */
-        private fun evIoctlInt(fd: FileDescriptor, request: Int, value: Int): Int {
-            // 首选原生 ioctl：Android 16（API 36）移除了三参 ioctlInt，
-            // 只剩 ioctlInt(FileDescriptor,int)（arg 固定 0），无法下发 EVIOCGRAB(1)。
-            val rawFd = runCatching { descriptorInt(fd) }.getOrNull()
-            if (rawFd != null && EvIoctlNative.ensureLoaded()) {
-                return EvIoctlNative.ioctl(rawFd, request, value)
-            }
-
-            var lastError: Throwable? = null
-            for (candidate in IoctlBridge.candidates) {
-                if (candidate.argMode == ArgMode.NONE && value != 0) continue
-                try {
-                    return candidate.invoke(fd, request, value)
-                } catch (e: java.lang.reflect.InvocationTargetException) {
-                    // 已进入目标方法：errno 等设备级错误直接上抛，不再换签名重试。
-                    throw e.targetException ?: e
-                } catch (t: Throwable) {
-                    lastError = t
-                }
-            }
-            val found = IoctlBridge.signatures
-            val detail = if (found.isEmpty()) "未发现 ioctlInt" else found.joinToString("; ")
-            throw UnsupportedOperationException(
-                "无可用 ioctl 通道（原生库: " + (EvIoctlNative.loadError ?: "加载失败") +
-                    "；反射签名: " + detail + "）" +
-                    (lastError?.let { "；最后错误: " + it.javaClass.simpleName + ": " + it.message } ?: "")
-            )
-        }
-
-        /** ioctl 参数传递方式（不同 Android 版本签名不同）。 */
-        private enum class ArgMode { INT, LONG, MUTABLE_INT, NONE }
-
-        private class IoctlCandidate(
-            private val target: Any?,
-            private val method: java.lang.reflect.Method,
-            val argMode: ArgMode,
-        ) {
-            fun invoke(fd: FileDescriptor, request: Int, value: Int): Int {
-                method.isAccessible = true
-                val result = when (argMode) {
-                    ArgMode.INT -> method.invoke(target, fd, request, value)
-                    ArgMode.LONG -> method.invoke(target, fd, request, value.toLong())
-                    ArgMode.MUTABLE_INT -> {
-                        val arg = IoctlBridge.mutableInt(value)
-                            ?: throw UnsupportedOperationException("android.util.MutableInt 不可用")
-                        method.invoke(target, fd, request, arg)
-                    }
-                    ArgMode.NONE -> method.invoke(target, fd, request)
-                }
-                return (result as? Int) ?: 0
-            }
-        }
-
         /**
-         * 运行时枚举 ioctlInt 候选：
-         * android.system.Os（静态）→ libcore.io.Libcore.os（实例）→ libcore.io.Linux（实例）。
-         * 优先 3 参 int > 3 参 MutableInt > 2 参（仅 arg=0 时可用）。
+         * 通过 JNI 原生桥下发 ioctl。
+         *
+         * Android 16（API 36）移除了三参 ioctlInt(FileDescriptor,int,int)，Java 反射
+         * 无法传递 EVIOCGRAB 的 arg=1；这里调用 libpadmouse_evioctl.so（CMake 构建，
+         * 符号 Java_com_fseven_padmouse_NativeIoctl_nativeIoctl）。
          */
-        private object IoctlBridge {
-
-            private val owners: List<Pair<Class<*>, Any?>> by lazy {
-                val result = ArrayList<Pair<Class<*>, Any?>>()
-                runCatching { Class.forName("android.system.Os") }.getOrNull()?.let {
-                    result += it to null
-                }
-                runCatching {
-                    val libcore = Class.forName("libcore.io.Libcore")
-                    val field = libcore.getDeclaredField("os").apply { isAccessible = true }
-                    field.get(null)
-                }.getOrNull()?.let { result += it.javaClass to it }
-                runCatching {
-                    Class.forName("libcore.io.Linux").getDeclaredConstructor().newInstance()
-                }.getOrNull()?.let { result += it.javaClass to it }
-                result
+        private fun evIoctlInt(
+            fd: FileDescriptor,
+            request: Int,
+            value: Int,
+            nativeLibDir: String?,
+        ): Int {
+            if (!NativeIoctl.ensureLoaded(nativeLibDir)) {
+                throw UnsupportedOperationException(
+                    "原生 ioctl 库不可用：" + (NativeIoctl.loadError ?: "未知原因")
+                )
             }
-
-            val candidates: List<IoctlCandidate> by lazy {
-                val list = ArrayList<IoctlCandidate>()
-                for ((owner, target) in owners) {
-                    val methods = runCatching {
-                        (owner.declaredMethods.asList() + owner.methods.asList())
-                            .filter { it.name == "ioctlInt" }
-                    }.getOrDefault(emptyList())
-                        .distinctBy { it.parameterTypes.joinToString(",") + "|" + it.parameterCount }
-                    for (method in methods) {
-                        val mode = argModeOf(method.parameterTypes) ?: continue
-                        list += IoctlCandidate(target, method, mode)
-                    }
-                }
-                list.sortedBy { it.argMode.ordinal }
-            }
-
-            /** 诊断用：当前进程实际可见的 ioctlInt 签名。 */
-            val signatures: List<String> by lazy {
-                runCatching {
-                    owners.flatMap { (owner, _) ->
-                        owner.declaredMethods.filter { it.name == "ioctlInt" }.map { method ->
-                            owner.simpleName + "#ioctlInt(" +
-                                method.parameterTypes.joinToString(",") { it.simpleName } + ")"
-                        }
-                    }.distinct()
-                }.getOrDefault(emptyList())
-            }
-
-            private val mutableIntCtor: java.lang.reflect.Constructor<*>? by lazy {
-                runCatching {
-                    Class.forName("android.util.MutableInt")
-                        .getDeclaredConstructor(Int::class.javaPrimitiveType)
-                        .apply { isAccessible = true }
-                }.getOrNull()
-            }
-
-            fun mutableInt(value: Int): Any? =
-                runCatching { mutableIntCtor?.newInstance(value) }.getOrNull()
-
-            private fun argModeOf(types: Array<Class<*>>): ArgMode? = when {
-                types.size == 3 && types[0] == FileDescriptor::class.java &&
-                    types[1] == Int::class.javaPrimitiveType &&
-                    types[2] == Int::class.javaPrimitiveType -> ArgMode.INT
-
-                types.size == 3 && types[0] == FileDescriptor::class.java &&
-                    types[1] == Int::class.javaPrimitiveType &&
-                    types[2] == java.lang.Long.TYPE -> ArgMode.LONG
-
-                types.size == 3 && types[0] == FileDescriptor::class.java &&
-                    types[1] == Int::class.javaPrimitiveType &&
-                    types[2].name == "android.util.MutableInt" -> ArgMode.MUTABLE_INT
-
-                types.size == 2 && types[0] == FileDescriptor::class.java &&
-                    types[1] == Int::class.javaPrimitiveType -> ArgMode.NONE
-
-                else -> null
-            }
+            val rawFd = runCatching { descriptorInt(fd) }.getOrNull()
+                ?: throw IllegalStateException("无法取得设备 fd")
+            return NativeIoctl.nativeIoctl(rawFd, request, value)
         }
 
         /** errno → 可读原因，避免界面只显示数字。 */
@@ -765,84 +654,6 @@ class GamepadReader(
             22 -> "EINVAL(22)"
             25 -> "ENOTTY(25)"
             else -> "errno=" + errno
-        }
-
-        /**
-         * 原生 ioctl 桥（libpadmouse_evioctl.so）。
-         *
-         * Android 16 移除了三参 ioctlInt，Java 层无法下发 EVIOCGRAB(1)；这里用 JNI
-         * 直接调用 libc ioctl。读取器运行在 Shizuku UserService（shell uid），其
-         * java.library.path 可能不含 APK 的 lib 目录，因此 loadLibrary 失败时
-         * 从 APK 解压到 /data/local/tmp 再 System.load（shell 域可执行该目录）。
-         */
-        private object EvIoctlNative {
-            private const val LIB_NAME = "padmouse_evioctl"
-            private const val LIB_FILE = "libpadmouse_evioctl.so"
-
-            @Volatile private var state = 0 // 0=未尝试 1=可用 2=不可用
-
-            @Volatile var loadError: String? = null
-                private set
-
-            private external fun nativeIoctl(fd: Int, request: Int, value: Int): Int
-
-            fun ensureLoaded(): Boolean {
-                if (state == 1) return true
-                if (state == 2) return false
-                synchronized(this) {
-                    if (state == 1) return true
-                    if (state == 2) return false
-                    if (runCatching { System.loadLibrary(LIB_NAME) }.isSuccess) {
-                        state = 1
-                        return true
-                    }
-                    val errors = ArrayList<String>()
-                    errors.add("loadLibrary(" + LIB_NAME + ") 失败")
-                    val extracted = extractFromApk()
-                    if (extracted == null) {
-                        errors.add("未能从 APK 解压 " + LIB_FILE)
-                    } else if (runCatching { System.load(extracted) }.isSuccess) {
-                        state = 1
-                        return true
-                    } else {
-                        errors.add("System.load(" + extracted + ") 失败")
-                    }
-                    loadError = errors.joinToString("；")
-                    state = 2
-                    return false
-                }
-            }
-
-            fun ioctl(fd: Int, request: Int, value: Int): Int = nativeIoctl(fd, request, value)
-
-            private fun extractFromApk(): String? {
-                val apk = apkPath() ?: return null
-                val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
-                val dir = File("/data/local/tmp")
-                if (!dir.isDirectory || !dir.canWrite()) return null
-                val target = File(dir, LIB_FILE)
-                return runCatching {
-                    ZipFile(apk).use { zip ->
-                        val entry = zip.getEntry("lib/" + abi + "/" + LIB_FILE) ?: return null
-                        zip.getInputStream(entry).use { input ->
-                            target.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    }
-                    target.setReadable(true, false)
-                    target.setExecutable(true, false)
-                    target.absolutePath
-                }.getOrNull()
-            }
-
-            private fun apkPath(): String? {
-                System.getProperty("java.class.path").orEmpty()
-                    .split(File.pathSeparator)
-                    .firstOrNull { it.endsWith(".apk") && File(it).isFile }
-                    ?.let { return it }
-                return runCatching {
-                    GamepadReader::class.java.protectionDomain?.codeSource?.location?.toURI()?.path
-                }.getOrNull()?.takeIf { it.endsWith(".apk") && File(it).isFile }
-            }
         }
 
         /** 异常 → 可展示的失败原因（带 errno 文案）。 */

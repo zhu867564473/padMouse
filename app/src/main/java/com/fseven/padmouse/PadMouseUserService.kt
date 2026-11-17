@@ -29,6 +29,9 @@ class PadMouseUserService : IPadMouse.Stub() {
     /** 保留监听器，独占开关变化时用新配置重建读取器。 */
     private var gamepadListener: IGamepadListener? = null
 
+    /** App 的 nativeLibraryDir，供 GamepadReader 显式 System.load 原生 ioctl 库。 */
+    private var nativeLibraryDir: String? = null
+
     /** 用户设置：独占手柄（默认开启）。 */
     private var exclusiveMode = true
 
@@ -184,12 +187,17 @@ class PadMouseUserService : IPadMouse.Stub() {
         if (result.startsWith("ERROR")) throw IllegalStateException(result)
     }
 
+    override fun setNativeLibraryDir(dir: String?) {
+        synchronized(gamepadLock) { nativeLibraryDir = dir }
+    }
+
     override fun startGamepadCapture(listener: IGamepadListener?) {
         val target = listener ?: return
         synchronized(gamepadLock) {
             gamepadReader?.stop()
             gamepadListener = target
-            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode).also { it.start() }
+            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode, nativeLibraryDir)
+                .also { it.start() }
         }
     }
 
@@ -213,7 +221,8 @@ class PadMouseUserService : IPadMouse.Stub() {
             exclusiveMode = enabled
             val target = gamepadListener ?: return
             gamepadReader?.stop()
-            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode).also { it.start() }
+            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode, nativeLibraryDir)
+                .also { it.start() }
         }
     }
 

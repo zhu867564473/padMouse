@@ -20,6 +20,8 @@ interface IPadMouse {
     String selfTest();
 
     // 手柄捕获：读 /dev/input，不抢前台焦点。
+    // App 的 nativeLibraryDir：UserService 进程用它显式 System.load 原生 ioctl 库。
+    void setNativeLibraryDir(String dir);
     void startGamepadCapture(IGamepadListener listener);
     void stopGamepadCapture();
     String describeGamepads();

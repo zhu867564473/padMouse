@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.fseven.padmouse"
     compileSdk = 36
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.fseven.padmouse"
@@ -14,6 +15,12 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
+
+        externalNativeBuild {
+            cmake {
+                abiFilters += listOf("arm64-v8a")
+            }
+        }
     }
 
     buildFeatures {
@@ -27,6 +34,13 @@ android {
         }
         debug {
             isMinifyEnabled = false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 

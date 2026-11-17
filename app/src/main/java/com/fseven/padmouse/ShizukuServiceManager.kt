@@ -156,6 +156,8 @@ class ShizukuServiceManager(
 
     fun shellExec(cmd: String): String = requireService().shellExec(cmd)
 
+    fun setNativeLibraryDir(dir: String) = requireService().setNativeLibraryDir(dir)
+
     fun startGamepadCapture(listener: IGamepadListener) = requireService().startGamepadCapture(listener)
 
     fun stopGamepadCapture() = requireService().stopGamepadCapture()
