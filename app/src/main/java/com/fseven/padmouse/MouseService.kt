@@ -35,6 +35,70 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
+ * M11 震动反馈设置（与 SettingsRepository 共用 padmouse_settings 文件）。
+ *
+ * 放在本文件而非 SettingsRepository，避免超出本轮影响范围。
+ *
+ * @param enabled 总开关
+ * @param intensity 强度百分比（0 / 25 / 50 / 75 / 100）；0 等价关闭
+ * @param clickEnabled 点击震动（左键 / 右键）
+ * @param modeToggleEnabled 模式切换震动
+ * @param screenshotEnabled 截图震动
+ */
+data class VibrationSettings(
+    val enabled: Boolean = true,
+    val intensity: Int = 100,
+    val clickEnabled: Boolean = true,
+    val modeToggleEnabled: Boolean = true,
+    val screenshotEnabled: Boolean = true,
+) {
+    /** VibrationEffect amplitude（0..255）；0 表示不震。 */
+    val amplitude: Int
+        get() = (MAX_AMPLITUDE * intensity / 100).coerceIn(0, MAX_AMPLITUDE)
+
+    companion object {
+        /** VibrationEffect 的 amplitude 合法上界；不要用 DEFAULT_AMPLITUDE（可能为 -1）。 */
+        const val MAX_AMPLITUDE = 255
+
+        /** 滑杆 0..4 档对应的百分比。 */
+        val INTENSITY_STEPS = intArrayOf(0, 25, 50, 75, 100)
+    }
+}
+
+private const val VIBRATION_PREFS = "padmouse_settings"
+private const val KEY_VIBRATION_ENABLED = "vibration_enabled"
+private const val KEY_VIBRATION_INTENSITY = "vibration_intensity"
+private const val KEY_VIBRATION_CLICK = "vibration_click"
+private const val KEY_VIBRATION_MODE_TOGGLE = "vibration_mode_toggle"
+private const val KEY_VIBRATION_SCREENSHOT = "vibration_screenshot"
+
+/** 读取 M11 震动设置；缺失/损坏的值按默认值兜底。 */
+fun loadVibrationSettings(context: Context): VibrationSettings {
+    val prefs = context.applicationContext
+        .getSharedPreferences(VIBRATION_PREFS, Context.MODE_PRIVATE)
+    return VibrationSettings(
+        enabled = prefs.getBoolean(KEY_VIBRATION_ENABLED, true),
+        intensity = prefs.getInt(KEY_VIBRATION_INTENSITY, 100).coerceIn(0, 100),
+        clickEnabled = prefs.getBoolean(KEY_VIBRATION_CLICK, true),
+        modeToggleEnabled = prefs.getBoolean(KEY_VIBRATION_MODE_TOGGLE, true),
+        screenshotEnabled = prefs.getBoolean(KEY_VIBRATION_SCREENSHOT, true),
+    )
+}
+
+/** 保存 M11 震动设置。 */
+fun saveVibrationSettings(context: Context, settings: VibrationSettings) {
+    context.applicationContext
+        .getSharedPreferences(VIBRATION_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(KEY_VIBRATION_ENABLED, settings.enabled)
+        .putInt(KEY_VIBRATION_INTENSITY, settings.intensity.coerceIn(0, 100))
+        .putBoolean(KEY_VIBRATION_CLICK, settings.clickEnabled)
+        .putBoolean(KEY_VIBRATION_MODE_TOGGLE, settings.modeToggleEnabled)
+        .putBoolean(KEY_VIBRATION_SCREENSHOT, settings.screenshotEnabled)
+        .apply()
+}
+
+/**
  * 手柄鼠标前台服务：光标悬浮窗 + 映射引擎 + 手柄监听全部常驻于此。
  *
  * M9 起映射不再依赖 Activity：
@@ -279,7 +343,7 @@ class MouseService : Service() {
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         settingsRepository = SettingsRepository(this)
-        vibrationSettings = settingsRepository.loadVibrationSettings()
+        vibrationSettings = loadVibrationSettings(this)
         modeToggleBinding = settingsRepository.loadModeToggleBinding()
         systemActions = SystemActions { command -> serviceManager.shellExec(command) }
         createNotificationChannel()
@@ -312,7 +376,7 @@ class MouseService : Service() {
 
             ACTION_UPDATE_VIBRATION -> {
                 // 改动立即生效：重新读持久化设置，下次触发即使用新参数，无需重启服务/重连手柄。
-                vibrationSettings = settingsRepository.loadVibrationSettings()
+                vibrationSettings = loadVibrationSettings(this)
                 return START_NOT_STICKY
             }
 

@@ -5,18 +5,21 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.CompoundButton
+import android.widget.LinearLayout
 import android.widget.RadioGroup
 import android.widget.SeekBar
 import android.widget.Spinner
@@ -240,13 +243,6 @@ class MainActivity : AppCompatActivity() {
         feelExponentValue = findViewById(R.id.feel_exponent_value)
         exclusiveSwitch = findViewById(R.id.switch_exclusive_mode)
         modeToggleSpinner = findViewById(R.id.spinner_mode_toggle)
-        vibrationSwitch = findViewById(R.id.switch_vibration_enabled)
-        vibrationIntensitySeek = findViewById(R.id.seek_vibration_intensity)
-        vibrationIntensityValue = findViewById(R.id.vibration_intensity_value)
-        vibrationClickCheck = findViewById(R.id.check_vibration_click)
-        vibrationModeCheck = findViewById(R.id.check_vibration_mode_toggle)
-        vibrationScreenshotCheck = findViewById(R.id.check_vibration_screenshot)
-        vibrationUnsupported = findViewById(R.id.vibration_unsupported)
 
         settingsRepository = SettingsRepository(this)
 
@@ -1181,21 +1177,90 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 震动区块：总开关 + 0/25/50/75/100% 强度 + 三个分项开关。
-     * 改动写入 SettingsRepository 后立刻通过 ACTION_UPDATE_VIBRATION 推给运行中的服务。
+     *
+     * 程序化构建（不新增布局文件），放在设置卡片末尾；
+     * 改动写入 padmouse_settings 后立刻通过 ACTION_UPDATE_VIBRATION 推给运行中的服务。
      */
     private fun setupVibrationControls() {
-        val settings = settingsRepository.loadVibrationSettings()
+        val settings = loadVibrationSettings(this)
         val supported = MouseService.isVibrationSupported(this)
+        val container = exclusiveSwitch.parent as? LinearLayout
 
-        vibrationSwitch.isChecked = settings.enabled
-        vibrationIntensitySeek.max = VibrationSettings.INTENSITY_STEPS.size - 1
-        vibrationIntensitySeek.progress = intensityIndex(settings.intensity)
-        vibrationClickCheck.isChecked = settings.clickEnabled
-        vibrationModeCheck.isChecked = settings.modeToggleEnabled
-        vibrationScreenshotCheck.isChecked = settings.screenshotEnabled
-        vibrationUnsupported.visibility = if (supported) View.GONE else View.VISIBLE
+        vibrationSwitch = SwitchMaterial(this).apply {
+            text = getString(R.string.vibration_enabled_label)
+            isChecked = settings.enabled
+            setPadding(0, dp(8), 0, 0)
+        }
+        vibrationIntensityValue = TextView(this)
+        vibrationIntensitySeek = SeekBar(this).apply {
+            max = VibrationSettings.INTENSITY_STEPS.size - 1
+            progress = intensityIndex(settings.intensity)
+        }
+        vibrationClickCheck = CheckBox(this).apply {
+            text = getString(R.string.vibration_click_label)
+            isChecked = settings.clickEnabled
+        }
+        vibrationModeCheck = CheckBox(this).apply {
+            text = getString(R.string.vibration_mode_toggle_label)
+            isChecked = settings.modeToggleEnabled
+        }
+        vibrationScreenshotCheck = CheckBox(this).apply {
+            text = getString(R.string.vibration_screenshot_label)
+            isChecked = settings.screenshotEnabled
+        }
+        vibrationUnsupported = TextView(this).apply {
+            text = getString(R.string.vibration_unsupported)
+            visibility = if (supported) View.GONE else View.VISIBLE
+        }
+
+        container?.let { parent ->
+            parent.addView(
+                TextView(this).apply {
+                    text = getString(R.string.vibration_section_title)
+                    setTypeface(typeface, Typeface.BOLD)
+                    setPadding(0, dp(16), 0, 0)
+                },
+                matchWrap()
+            )
+            parent.addView(vibrationSwitch, matchWrap())
+
+            val intensityRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(
+                    TextView(this@MainActivity).apply {
+                        text = getString(R.string.vibration_intensity_label)
+                    },
+                    LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                    )
+                )
+                addView(
+                    vibrationIntensityValue,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                )
+            }
+            parent.addView(intensityRow, matchWrap(topMargin = 8))
+            parent.addView(vibrationIntensitySeek, matchWrap())
+            parent.addView(vibrationClickCheck, matchWrap())
+            parent.addView(vibrationModeCheck, matchWrap())
+            parent.addView(vibrationScreenshotCheck, matchWrap())
+            parent.addView(vibrationUnsupported, matchWrap(topMargin = 4))
+            parent.addView(
+                TextView(this).apply {
+                    text = getString(R.string.vibration_hint)
+                    setPadding(0, dp(4), 0, dp(8))
+                },
+                matchWrap()
+            )
+        }
+
         updateVibrationLabels()
-
         vibrationSwitch.isEnabled = supported
         if (supported) applyVibrationEnabledState(settings.enabled) else {
             vibrationIntensitySeek.isEnabled = false
@@ -1235,7 +1300,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveVibrationSettings() {
-        settingsRepository.saveVibrationSettings(
+        saveVibrationSettings(
+            this,
             VibrationSettings(
                 enabled = vibrationSwitch.isChecked,
                 intensity = selectedVibrationIntensity(),
@@ -1274,6 +1340,16 @@ class MainActivity : AppCompatActivity() {
         val steps = VibrationSettings.INTENSITY_STEPS
         return steps.indexOf(intensity).takeIf { it >= 0 } ?: steps.lastIndex
     }
+
+    /** 程序化设置项的通用布局参数（match_parent × wrap_content + 上边距）。 */
+    private fun matchWrap(topMargin: Int = 0): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { this.topMargin = dp(topMargin) }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).roundToInt()
 
     // ---------------------------------------------------------------- 四、设置：按键绑定
 
