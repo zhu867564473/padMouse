@@ -12,6 +12,7 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipFile
 
 /**
  * 在 UserService（Shizuku shell uid）进程内读取手柄原始输入。
@@ -477,7 +478,7 @@ class GamepadReader(
                     null
                 } else {
                     grabbed = false
-                    "EVIOCGRAB 返回 $result"
+                    "EVIOCGRAB 失败: " + errnoText(result)
                 }
             } catch (t: Throwable) {
                 grabbed = false
@@ -500,7 +501,7 @@ class GamepadReader(
                     grabbed = false
                     true
                 } else {
-                    Log.w(TAG, "EVIOCGRAB(0) 返回 $result，保留抓取状态直至 fd 关闭")
+                    Log.w(TAG, "EVIOCGRAB(0) 失败: " + errnoText(result) + "，保留抓取状态直至 fd 关闭")
                     false
                 }
             } catch (t: Throwable) {
@@ -621,6 +622,13 @@ class GamepadReader(
          * 由 [DeviceSession.grab] 转成界面上可见的失败原因。
          */
         private fun evIoctlInt(fd: FileDescriptor, request: Int, value: Int): Int {
+            // 首选原生 ioctl：Android 16（API 36）移除了三参 ioctlInt，
+            // 只剩 ioctlInt(FileDescriptor,int)（arg 固定 0），无法下发 EVIOCGRAB(1)。
+            val rawFd = runCatching { descriptorInt(fd) }.getOrNull()
+            if (rawFd != null && EvIoctlNative.ensureLoaded()) {
+                return EvIoctlNative.ioctl(rawFd, request, value)
+            }
+
             var lastError: Throwable? = null
             for (candidate in IoctlBridge.candidates) {
                 if (candidate.argMode == ArgMode.NONE && value != 0) continue
@@ -636,8 +644,9 @@ class GamepadReader(
             val found = IoctlBridge.signatures
             val detail = if (found.isEmpty()) "未发现 ioctlInt" else found.joinToString("; ")
             throw UnsupportedOperationException(
-                "无可用 ioctlInt(FileDescriptor,int,arg) 签名（已发现: $detail）" +
-                    (lastError?.let { "；最后错误: ${it.javaClass.simpleName}: ${it.message}" } ?: "")
+                "无可用 ioctl 通道（原生库: " + (EvIoctlNative.loadError ?: "加载失败") +
+                    "；反射签名: " + detail + "）" +
+                    (lastError?.let { "；最后错误: " + it.javaClass.simpleName + ": " + it.message } ?: "")
             )
         }
 
@@ -744,6 +753,95 @@ class GamepadReader(
                     types[1] == Int::class.javaPrimitiveType -> ArgMode.NONE
 
                 else -> null
+            }
+        }
+
+        /** errno → 可读原因，避免界面只显示数字。 */
+        private fun errnoText(errno: Int): String = when (errno) {
+            1 -> "EPERM(1)"
+            13 -> "EACCES(13)"
+            16 -> "EBUSY(16)"
+            19 -> "ENODEV(19)"
+            22 -> "EINVAL(22)"
+            25 -> "ENOTTY(25)"
+            else -> "errno=" + errno
+        }
+
+        /**
+         * 原生 ioctl 桥（libpadmouse_evioctl.so）。
+         *
+         * Android 16 移除了三参 ioctlInt，Java 层无法下发 EVIOCGRAB(1)；这里用 JNI
+         * 直接调用 libc ioctl。读取器运行在 Shizuku UserService（shell uid），其
+         * java.library.path 可能不含 APK 的 lib 目录，因此 loadLibrary 失败时
+         * 从 APK 解压到 /data/local/tmp 再 System.load（shell 域可执行该目录）。
+         */
+        private object EvIoctlNative {
+            private const val LIB_NAME = "padmouse_evioctl"
+            private const val LIB_FILE = "libpadmouse_evioctl.so"
+
+            @Volatile private var state = 0 // 0=未尝试 1=可用 2=不可用
+
+            @Volatile var loadError: String? = null
+                private set
+
+            private external fun nativeIoctl(fd: Int, request: Int, value: Int): Int
+
+            fun ensureLoaded(): Boolean {
+                if (state == 1) return true
+                if (state == 2) return false
+                synchronized(this) {
+                    if (state == 1) return true
+                    if (state == 2) return false
+                    if (runCatching { System.loadLibrary(LIB_NAME) }.isSuccess) {
+                        state = 1
+                        return true
+                    }
+                    val errors = ArrayList<String>()
+                    errors.add("loadLibrary(" + LIB_NAME + ") 失败")
+                    val extracted = extractFromApk()
+                    if (extracted == null) {
+                        errors.add("未能从 APK 解压 " + LIB_FILE)
+                    } else if (runCatching { System.load(extracted) }.isSuccess) {
+                        state = 1
+                        return true
+                    } else {
+                        errors.add("System.load(" + extracted + ") 失败")
+                    }
+                    loadError = errors.joinToString("；")
+                    state = 2
+                    return false
+                }
+            }
+
+            fun ioctl(fd: Int, request: Int, value: Int): Int = nativeIoctl(fd, request, value)
+
+            private fun extractFromApk(): String? {
+                val apk = apkPath() ?: return null
+                val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+                val dir = File("/data/local/tmp")
+                if (!dir.isDirectory || !dir.canWrite()) return null
+                val target = File(dir, LIB_FILE)
+                return runCatching {
+                    ZipFile(apk).use { zip ->
+                        val entry = zip.getEntry("lib/" + abi + "/" + LIB_FILE) ?: return null
+                        zip.getInputStream(entry).use { input ->
+                            target.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                    target.setReadable(true, false)
+                    target.setExecutable(true, false)
+                    target.absolutePath
+                }.getOrNull()
+            }
+
+            private fun apkPath(): String? {
+                System.getProperty("java.class.path").orEmpty()
+                    .split(File.pathSeparator)
+                    .firstOrNull { it.endsWith(".apk") && File(it).isFile }
+                    ?.let { return it }
+                return runCatching {
+                    GamepadReader::class.java.protectionDomain?.codeSource?.location?.toURI()?.path
+                }.getOrNull()?.takeIf { it.endsWith(".apk") && File(it).isFile }
             }
         }
 
