@@ -463,6 +463,52 @@
                     android:text="@string/settings_card_title"
                     android:textAppearance="?attr/textAppearanceTitleMedium" />
 
+                <!-- M12 输入模式：UHID 系统虚拟鼠标 / 触摸注入 -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="@string/input_mode_section_title"
+                    android:textAppearance="?attr/textAppearanceTitleSmall" />
+
+                <RadioGroup
+                    android:id="@+id/radio_group_input_mode"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:orientation="vertical">
+
+                    <RadioButton
+                        android:id="@+id/radio_input_mode_uhid"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:checked="true"
+                        android:text="@string/input_mode_uhid" />
+
+                    <RadioButton
+                        android:id="@+id/radio_input_mode_touch"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/input_mode_touch" />
+
+                </RadioGroup>
+
+                <TextView
+                    android:id="@+id/input_mode_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/input_mode_status_idle"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:textColor="?attr/colorPrimary" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/input_mode_hint"
+                    android:textAppearance="?attr/textAppearanceBodySmall" />
+
                 <com.google.android.material.switchmaterial.SwitchMaterial
                     android:id="@+id/switch_exclusive_mode"
                     android:layout_width="match_parent"
@@ -483,6 +529,15 @@
                     android:layout_marginTop="12dp"
                     android:text="@string/cursor_section_title"
                     android:textAppearance="?attr/textAppearanceTitleSmall" />
+
+                <TextView
+                    android:id="@+id/cursor_appearance_hint"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/cursor_appearance_system_managed"
+                    android:textAppearance="?attr/textAppearanceBodySmall"
+                    android:visibility="gone" />
 
                 <LinearLayout
                     android:layout_width="match_parent"

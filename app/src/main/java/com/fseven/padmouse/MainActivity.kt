@@ -103,6 +103,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var modeToggleSpinner: Spinner
     private var modeToggleBinding: ActionBinding = SettingsRepository.DEFAULT_MODE_TOGGLE_BINDING
 
+    // 四、设置：M12 输入模式
+    private lateinit var inputModeGroup: RadioGroup
+    private lateinit var inputModeStatus: TextView
+    private lateinit var cursorAppearanceHint: TextView
+
     // 四、设置：光标外观
     private lateinit var cursorSizeSeek: SeekBar
     private lateinit var cursorSizeValue: TextView
@@ -158,6 +163,7 @@ class MainActivity : AppCompatActivity() {
             renderMappingStatus()
             renderMappingPanel()
             renderGamepadPanel()
+            renderInputModeStatus()
             mappingStatus.postDelayed(this, MAPPING_POLL_MS)
         }
     }
@@ -230,6 +236,9 @@ class MainActivity : AppCompatActivity() {
         gamepadAxes = findViewById(R.id.gamepad_axes)
         gamepadEvents = findViewById(R.id.gamepad_events)
         gamepadRefreshButton = findViewById(R.id.button_refresh_gamepad)
+        inputModeGroup = findViewById(R.id.radio_group_input_mode)
+        inputModeStatus = findViewById(R.id.input_mode_status)
+        cursorAppearanceHint = findViewById(R.id.cursor_appearance_hint)
         cursorSizeSeek = findViewById(R.id.seek_cursor_size)
         cursorSizeValue = findViewById(R.id.cursor_size_value)
         cursorIdleSeek = findViewById(R.id.seek_cursor_idle)
@@ -269,6 +278,7 @@ class MainActivity : AppCompatActivity() {
         setupSystemBindings()
         setupModeToggleBinding()
         setupExclusiveControls()
+        setupInputModeControls()
         setupCursorControls()
         setupFeelControls()
         setupVibrationControls()
@@ -291,6 +301,8 @@ class MainActivity : AppCompatActivity() {
         renderRunState()
         renderMappingPanel()
         renderGamepadPanel()
+        renderInputModeStatus()
+        applyCursorAppearanceEnabled(settingsRepository.loadInputMode())
         renderOnboarding()
         // MouseService 启动时自检补开的界面提示（不弹 Toast 打扰）。
         val persistedNotice = MouseService.takePermissionNotice()
@@ -994,6 +1006,86 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------------------------------------------------------------- 四、设置：M12 输入模式
+
+    /**
+     * 输入模式：UHID 系统虚拟鼠标（默认）/ 触摸注入（兼容/游戏）。
+     *
+     * 切换时持久化并通知运行中的 MouseService 立即创建/销毁 /dev/uhid 设备；
+     * UHID 模式下系统负责画光标，App 内光标大小/颜色/自动隐藏置灰并说明原因。
+     */
+    private fun setupInputModeControls() {
+        val mode = settingsRepository.loadInputMode()
+        inputModeGroup.check(
+            if (mode == InputMode.TOUCH) R.id.radio_input_mode_touch
+            else R.id.radio_input_mode_uhid
+        )
+        applyCursorAppearanceEnabled(mode)
+        renderInputModeStatus()
+
+        inputModeGroup.setOnCheckedChangeListener { _, checkedId ->
+            val selected = if (checkedId == R.id.radio_input_mode_touch) {
+                InputMode.TOUCH
+            } else {
+                InputMode.UHID
+            }
+            settingsRepository.saveInputMode(selected)
+            applyCursorAppearanceEnabled(selected)
+            renderInputModeStatus()
+            pushInputMode()
+        }
+    }
+
+    /** 通知运行中的服务切换后端；服务未运行时设置已持久化，下次启动生效。 */
+    private fun pushInputMode() {
+        if (!MouseService.isRunning) return
+        try {
+            startService(
+                Intent(this, MouseService::class.java)
+                    .setAction(MouseService.ACTION_UPDATE_INPUT_MODE)
+            )
+        } catch (_: Throwable) {
+            // 服务可能刚好停止；设置已写入，下次启动会应用。
+        }
+    }
+
+    /** UHID 模式下置灰光标外观设置（系统绘制，App 不再控制大小/颜色/自动隐藏）。 */
+    private fun applyCursorAppearanceEnabled(mode: InputMode) {
+        if (!::cursorSizeSeek.isInitialized) return
+        val touch = mode == InputMode.TOUCH
+        cursorSizeSeek.isEnabled = touch
+        cursorIdleSeek.isEnabled = touch
+        for (index in 0 until cursorColorGroup.childCount) {
+            cursorColorGroup.getChildAt(index).isEnabled = touch
+        }
+        val alpha = if (touch) 1f else DISABLED_ALPHA
+        cursorSizeSeek.alpha = alpha
+        cursorIdleSeek.alpha = alpha
+        cursorColorGroup.alpha = alpha
+        cursorSizeValue.alpha = alpha
+        cursorIdleValue.alpha = alpha
+        cursorAppearanceHint.visibility = if (touch) View.GONE else View.VISIBLE
+    }
+
+    /** 设置页状态行：模式 + UHID 设备真实状态（创建失败会显示错误原因）。 */
+    private fun renderInputModeStatus() {
+        if (!::inputModeStatus.isInitialized) return
+        val mode = settingsRepository.loadInputMode()
+        val text = when {
+            mode == InputMode.TOUCH -> getString(R.string.input_mode_status_touch)
+            MouseService.uhidActive -> getString(R.string.input_mode_status_uhid_active)
+            MouseService.isRunning && MouseService.uhidStatus.startsWith("ERROR") ->
+                getString(
+                    R.string.input_mode_status_uhid_failed,
+                    MouseService.uhidStatus.removePrefix("ERROR:").trim()
+                )
+
+            MouseService.isRunning -> getString(R.string.input_mode_status_uhid_connecting)
+            else -> getString(R.string.input_mode_status_idle)
+        }
+        if (inputModeStatus.text != text) inputModeStatus.text = text
+    }
+
     // ---------------------------------------------------------------- 四、设置：光标外观
 
     private fun setupCursorControls() {
@@ -1630,6 +1722,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val MAPPING_RENDER_INTERVAL_MS = 50L
+        private const val DISABLED_ALPHA = 0.4f
         private const val MAPPING_POLL_MS = 100L
         private const val RUN_STATE_POLL_MS = 1000L
         private const val REQUEST_NOTIFICATIONS = 1001

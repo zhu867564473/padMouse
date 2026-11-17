@@ -147,6 +147,17 @@ class MouseService : Service() {
 
     private var rebindScheduled = false
 
+    // ---------------------------------------------------------------- M12 输入后端
+
+    /** 用户设置：UHID 鼠标 / 触摸注入。 */
+    private var inputMode = InputMode.UHID
+
+    /** 实际生效的后端：UHID 创建失败时会临时回退触摸注入。 */
+    private var effectiveInputMode = InputMode.TOUCH
+
+    /** 已应用的后端；避免每次推手感配置都重复创建 /dev/uhid 设备。 */
+    private var appliedInputMode: InputMode? = null
+
     // ---------------------------------------------------------------- M10 独占 / 模式
 
     /** 游戏模式：设备已交还系统，不抓取、不映射、不注入。 */
@@ -251,6 +262,28 @@ class MouseService : Service() {
         override fun scroll(x: Float, y: Float, h: Float, v: Float) =
             dispatchInjection { serviceManager.scroll(x, y, h, v) }
 
+        // M12 UHID 后端：全部落到 UserService（shell 进程）的 /dev/uhid 写入。
+        override fun uhidMove(dx: Int, dy: Int) = dispatchInjection {
+            uhidBinder()?.let { binder ->
+                runCatching { binder.uhidMouseMove(dx, dy) }
+                    .onFailure { Log.d(TAG, "UHID move 失败", it) }
+            }
+        }
+
+        override fun uhidButton(mask: Int) = dispatchInjection {
+            uhidBinder()?.let { binder ->
+                runCatching { binder.uhidMouseButton(mask) }
+                    .onFailure { Log.d(TAG, "UHID button 失败", it) }
+            }
+        }
+
+        override fun uhidWheel(delta: Int) = dispatchInjection {
+            uhidBinder()?.let { binder ->
+                runCatching { binder.uhidMouseWheel(delta) }
+                    .onFailure { Log.d(TAG, "UHID wheel 失败", it) }
+            }
+        }
+
         override fun systemAction(action: SystemAction) = dispatchInjection {
             if (!serviceManager.isReady) {
                 Log.w(TAG, "系统动作 " + action + " 跳过：UserService 未就绪")
@@ -345,6 +378,7 @@ class MouseService : Service() {
         settingsRepository = SettingsRepository(this)
         vibrationSettings = loadVibrationSettings(this)
         modeToggleBinding = settingsRepository.loadModeToggleBinding()
+        inputMode = settingsRepository.loadInputMode()
         systemActions = SystemActions { command -> serviceManager.shellExec(command) }
         createNotificationChannel()
 
@@ -377,6 +411,12 @@ class MouseService : Service() {
             ACTION_UPDATE_VIBRATION -> {
                 // 改动立即生效：重新读持久化设置，下次触发即使用新参数，无需重启服务/重连手柄。
                 vibrationSettings = loadVibrationSettings(this)
+                return START_NOT_STICKY
+            }
+
+            ACTION_UPDATE_INPUT_MODE -> {
+                // 输入后端切换：UHID 需要创建/销毁 /dev/uhid 设备，触摸模式恢复自绘光标。
+                if (cursorView != null) applyInputBackend(settingsRepository.loadInputMode(), force = true)
                 return START_NOT_STICKY
             }
 
@@ -474,14 +514,17 @@ class MouseService : Service() {
         if (cursorView == null || !serviceManager.isReady) return
 
         MouseRuntime.setStage(RunStage.READING_GAMEPAD)
-        // 每次启动都从鼠标模式开始：光标可见、设备重新抓取。
+        // 每次启动都从鼠标模式开始：设备重新抓取。
         if (inGameMode) {
             inGameMode = false
             MouseService.setGameModeState(false)
         }
-        setOverlayVisible(true)
         // UserService 进程是 daemon，模式状态会跨服务重启保留；启动时强制回到鼠标模式。
         runCatching { serviceManager.setMouseMode(true) }
+        // M12：按用户设置创建 UHID 或恢复自绘光标；force 保证每次都重新对齐。
+        inputMode = settingsRepository.loadInputMode()
+        appliedInputMode = null
+        applyInputBackend(inputMode, force = true)
         if (!startGamepadCapture()) {
             MouseRuntime.setStage(
                 RunStage.FAILED,
@@ -537,6 +580,10 @@ class MouseService : Service() {
     private fun stopMappingEngine() {
         handler.removeCallbacks(modeToggleRunnable)
         handler.removeCallbacks(exclusiveStatusPoller)
+        // M12：先销毁虚拟鼠标，系统输入层不残留设备。
+        destroyUhidDevice()
+        appliedInputMode = null
+        MouseService.setUhidState(false, "")
         if (gamepadCaptureStarted) {
             // reader.stop() 内部对每个 fd 先 EVIOCGRAB 0 再关闭，系统立即恢复接收。
             runCatching { serviceManager.stopGamepadCapture() }
@@ -545,7 +592,9 @@ class MouseService : Service() {
         if (::mapper.isInitialized && mapper.isRunning) mapper.stop()
         MouseRuntime.mappingRunning = false
         inGameMode = false
-        setOverlayVisible(true)
+        // UHID 模式下即使连接暂时中断也不显示自绘箭头，避免和系统光标重叠；
+        // 触摸模式（或已回退）才恢复自绘光标。
+        if (effectiveInputMode == InputMode.TOUCH) setOverlayVisible(true)
         MouseService.setGameModeState(false)
         MouseService.setExclusiveState(false, null)
     }
@@ -615,6 +664,82 @@ class MouseService : Service() {
             } catch (t: Throwable) {
                 Log.w(TAG, "映射注入失败", t)
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- M12 UHID 后端
+
+    /**
+     * 取回 IPadMouse binder。
+     *
+     * 本轮影响范围未包含 ShizukuServiceManager.kt，这里按字段类型从管理器取回
+     * 唯一一个 IPadMouse 类型的字段（即当前 UserService 代理），避免修改范围外文件。
+     * 未连接时返回 null，调用方静默跳过。
+     */
+    private val uhidBinderField by lazy {
+        ShizukuServiceManager::class.java.declaredFields
+            .firstOrNull { IPadMouse::class.java.isAssignableFrom(it.type) }
+            ?.apply { isAccessible = true }
+    }
+
+    private fun uhidBinder(): IPadMouse? = runCatching {
+        uhidBinderField?.get(serviceManager) as? IPadMouse
+    }.getOrNull()
+
+    private fun createUhidDevice(): String {
+        val binder = uhidBinder() ?: return "ERROR: UserService 未连接"
+        return runCatching { binder.createUhidMouse() }.getOrElse { t ->
+            "ERROR: ${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    private fun destroyUhidDevice() {
+        uhidBinder()?.let { binder ->
+            runCatching { binder.destroyUhidMouse() }
+                .onFailure { Log.d(TAG, "销毁 UHID 设备失败（可能已断开）", it) }
+        }
+    }
+
+    /**
+     * 应用输入后端：
+     * - UHID：创建 /dev/uhid 设备、隐藏自绘光标、让 Mapper 走相对位移；
+     *   创建失败时回退触摸注入并保留错误状态，保证至少还能用。
+     * - TOUCH：销毁 UHID 设备、恢复自绘光标。
+     */
+    private fun applyInputBackend(mode: InputMode, force: Boolean = false) {
+        inputMode = mode
+        if (!force && appliedInputMode == mode) return
+        if (!serviceManager.isReady) {
+            appliedInputMode = null
+            return
+        }
+        appliedInputMode = mode
+
+        if (mode == InputMode.UHID) {
+            val status = createUhidDevice()
+            if (!status.startsWith("ERROR")) {
+                effectiveInputMode = InputMode.UHID
+                if (::mapper.isInitialized) mapper.updateInputMode(InputMode.UHID)
+                setOverlayVisible(false)
+                MouseService.setUhidState(true, status)
+                Log.i(TAG, "UHID 虚拟鼠标就绪: $status")
+            } else {
+                effectiveInputMode = InputMode.TOUCH
+                if (::mapper.isInitialized) mapper.updateInputMode(InputMode.TOUCH)
+                setOverlayVisible(true)
+                MouseService.setUhidState(false, status)
+                MouseRuntime.setStage(
+                    RunStage.RUNNING,
+                    getString(R.string.run_detail_uhid_fallback, status)
+                )
+                Log.w(TAG, "UHID 创建失败，回退触摸注入: $status")
+            }
+        } else {
+            destroyUhidDevice()
+            effectiveInputMode = InputMode.TOUCH
+            if (::mapper.isInitialized) mapper.updateInputMode(InputMode.TOUCH)
+            setOverlayVisible(true)
+            MouseService.setUhidState(false, "")
         }
     }
 
@@ -871,6 +996,11 @@ class MouseService : Service() {
         MouseRuntime.mappingRunning = false
         // 只 ungrab，不关闭 fd：热键仍能读到来切回。
         runCatching { serviceManager.setMouseMode(false) }
+        // M12：游戏模式释放 UHID 设备，避免虚拟鼠标继续占用系统输入。
+        destroyUhidDevice()
+        appliedInputMode = null
+        effectiveInputMode = InputMode.TOUCH
+        MouseService.setUhidState(false, "game mode")
         setOverlayVisible(false)
         MouseService.setGameModeState(true)
         MouseRuntime.notifyChanged()
@@ -883,8 +1013,10 @@ class MouseService : Service() {
         inGameMode = false
         vibrateOnce(VibrationKind.MODE_TOGGLE)
         runCatching { serviceManager.setMouseMode(true) }
+        // M12：按设置重新创建 UHID（或恢复自绘光标），再恢复光标位置。
+        appliedInputMode = null
+        applyInputBackend(inputMode, force = true)
         applyPosition(savedCursorX, savedCursorY, updateLayout = true)
-        setOverlayVisible(true)
         if (::mapper.isInitialized && !mapper.isRunning && cursorView != null) {
             mapper.updateConfig(currentConfig())
             mapper.start(screenWidth, screenHeight)
@@ -1096,6 +1228,7 @@ class MouseService : Service() {
         const val ACTION_UPDATE_CONFIG = "com.fseven.padmouse.action.UPDATE_CONFIG"
         const val ACTION_UPDATE_EXCLUSIVE = "com.fseven.padmouse.action.UPDATE_EXCLUSIVE"
         const val ACTION_UPDATE_VIBRATION = "com.fseven.padmouse.action.UPDATE_VIBRATION"
+        const val ACTION_UPDATE_INPUT_MODE = "com.fseven.padmouse.action.UPDATE_INPUT_MODE"
         const val ACTION_STOP = "com.fseven.padmouse.action.STOP_CURSOR"
 
         const val EXTRA_SIZE_DP = "extra_size_dp"
@@ -1178,6 +1311,22 @@ class MouseService : Service() {
         @Volatile
         var gameMode: Boolean = false
             private set
+
+        /** M12：UHID 虚拟鼠标是否已创建并注册到系统。 */
+        @Volatile
+        var uhidActive: Boolean = false
+            private set
+
+        /** M12：UHID 状态/错误串，供设置页展示。 */
+        @Volatile
+        var uhidStatus: String = ""
+            private set
+
+        fun setUhidState(active: Boolean, status: String) {
+            uhidActive = active
+            uhidStatus = status
+            MouseRuntime.notifyChanged()
+        }
 
         fun setExclusiveState(active: Boolean, error: String?) {
             exclusiveActive = active

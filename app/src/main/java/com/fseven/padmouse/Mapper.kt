@@ -106,6 +106,12 @@ class Mapper(
 
         /** M6 系统动作；实现方负责转到后台线程执行 shell 命令。 */
         fun systemAction(action: SystemAction)
+
+        // M12 UHID 后端：相对位移、按键位掩码、滚轮格数。
+        // 触摸注入后端继续走上面的绝对坐标方法；两套后端由 [Mapper.inputMode] 分发。
+        fun uhidMove(dx: Int, dy: Int)
+        fun uhidButton(mask: Int)
+        fun uhidWheel(delta: Int)
     }
 
     /** 调试面板监听；全部在主线程回调。 */
@@ -129,6 +135,21 @@ class Mapper(
     private var rightStickY = 0f
 
     private var scrollAccumulator = 0f
+
+    /** M12：当前输入后端。UHID = 系统原生光标 + 相对位移；TOUCH = 旧的自绘光标 + 绝对注入。 */
+    private var inputMode: InputMode = InputMode.UHID
+
+    /** UHID 当前按键位掩码（bit0 左键 / bit1 右键 / bit2 中键）。 */
+    private var uhidButtons = 0
+
+    /** UHID 相对位移的亚像素余量，慢推时保留小数部分避免不动。 */
+    private var uhidAccumX = 0f
+    private var uhidAccumY = 0f
+
+    /** UHID 模式下各物理键的按下状态；与扳机共用同一位掩码。 */
+    private var uhidTapHeld = false
+    private var uhidRightHeld = false
+    private var uhidMiddleHeld = false
 
     /** A 键（TAP 绑定）当前是否按下；长按到达阈值后进入拖拽。 */
     private var tapKeyActive = false
@@ -162,6 +183,35 @@ class Mapper(
     }
 
     /**
+     * 切换输入后端（M12）。
+     *
+     * UHID → 触摸：先松开 UHID 按键，再恢复旧的触摸/鼠标状态；
+     * 触摸 → UHID：先补发触摸/鼠标抬笔，清空位移与滚轮余量，避免切后端时按键卡住。
+     */
+    fun updateInputMode(mode: InputMode) {
+        if (inputMode == mode) return
+        inputMode = mode
+        if (mode == InputMode.TOUCH) {
+            uhidTapHeld = false
+            uhidRightHeld = false
+            uhidMiddleHeld = false
+            if (uhidButtons != 0) {
+                uhidButtons = 0
+                runCatching { injector.uhidButton(0) }
+            }
+            resetTouchState()
+        } else {
+            resetTouchState()
+            uhidButtons = 0
+        }
+        uhidAccumX = 0f
+        uhidAccumY = 0f
+        scrollAccumulator = 0f
+        tapKeyActive = false
+        dragging = false
+    }
+
+    /**
      * 开始 60Hz 驱动。屏幕尺寸用于钳制光标；初始位置取当前悬浮光标，
      * 光标服务尚未就绪时退回屏幕中心。
      */
@@ -183,6 +233,12 @@ class Mapper(
         rightStickX = 0f
         rightStickY = 0f
         scrollAccumulator = 0f
+        uhidAccumX = 0f
+        uhidAccumY = 0f
+        uhidButtons = 0
+        uhidTapHeld = false
+        uhidRightHeld = false
+        uhidMiddleHeld = false
         tapKeyActive = false
         dragging = false
         primaryHeld = false
@@ -258,9 +314,30 @@ class Mapper(
 
         val action = config.buttonBindings[code] ?: return
         when (action) {
-            MouseAction.TAP -> handleTapKey(1)
+            MouseAction.TAP -> {
+                if (inputMode == InputMode.UHID) {
+                    // UHID：按下即按住左键，松开才释放；按住移动天然就是拖拽。
+                    uhidTapHeld = true
+                    refreshUhidButtons()
+                    tapKeyDownAt = SystemClock.uptimeMillis()
+                } else {
+                    handleTapKey(1)
+                }
+            }
             // 右键/中键在松开时触发，避免组合判定窗口引入点击延迟。
-            MouseAction.RIGHT_CLICK, MouseAction.MIDDLE_CLICK -> Unit
+            MouseAction.RIGHT_CLICK -> {
+                if (inputMode == InputMode.UHID) {
+                    uhidRightHeld = true
+                    refreshUhidButtons()
+                }
+            }
+
+            MouseAction.MIDDLE_CLICK -> {
+                if (inputMode == InputMode.UHID) {
+                    uhidMiddleHeld = true
+                    refreshUhidButtons()
+                }
+            }
             MouseAction.SCROLL_UP, MouseAction.SCROLL_DOWN -> {
                 if (participatesInChord(code)) {
                     schedulePending(code, config.chordGraceMs) { fireScroll(action) }
@@ -280,14 +357,33 @@ class Mapper(
         // 系统动作优先于鼠标映射：该键绑定系统动作时，松开不再触发鼠标动作。
         if (systemBindingForKey(code) != null) return
         when (config.buttonBindings[code]) {
-            MouseAction.TAP -> handleTapKey(0)
+            MouseAction.TAP -> {
+                if (inputMode == InputMode.UHID) {
+                    uhidTapHeld = false
+                    refreshUhidButtons()
+                    emit(MapperAction.TAP)
+                } else {
+                    handleTapKey(0)
+                }
+            }
+
             MouseAction.RIGHT_CLICK -> {
-                injector.rightClick(cursorX, cursorY)
+                if (inputMode == InputMode.UHID) {
+                    uhidRightHeld = false
+                    refreshUhidButtons()
+                } else {
+                    injector.rightClick(cursorX, cursorY)
+                }
                 emit(MapperAction.RIGHT_CLICK)
             }
 
             MouseAction.MIDDLE_CLICK -> {
-                injector.middleClick(cursorX, cursorY)
+                if (inputMode == InputMode.UHID) {
+                    uhidMiddleHeld = false
+                    refreshUhidButtons()
+                } else {
+                    injector.middleClick(cursorX, cursorY)
+                }
                 emit(MapperAction.MIDDLE_CLICK)
             }
 
@@ -300,12 +396,21 @@ class Mapper(
     private fun fireScroll(action: MouseAction) {
         when (action) {
             MouseAction.SCROLL_UP -> {
-                injector.scroll(cursorX, cursorY, 0f, -1f)
+                if (inputMode == InputMode.UHID) {
+                    // HID Wheel：正数向上。
+                    injector.uhidWheel(1)
+                } else {
+                    injector.scroll(cursorX, cursorY, 0f, -1f)
+                }
                 emit(MapperAction.SCROLL_UP)
             }
 
             MouseAction.SCROLL_DOWN -> {
-                injector.scroll(cursorX, cursorY, 0f, 1f)
+                if (inputMode == InputMode.UHID) {
+                    injector.uhidWheel(-1)
+                } else {
+                    injector.scroll(cursorX, cursorY, 0f, 1f)
+                }
                 emit(MapperAction.SCROLL_DOWN)
             }
 
@@ -422,11 +527,19 @@ class Mapper(
             MouseAction.LEFT_HOLD -> {
                 if (press && !primaryHeld) {
                     primaryHeld = true
-                    injector.mouseDown(cursorX, cursorY, MotionEvent.BUTTON_PRIMARY)
+                    if (inputMode == InputMode.UHID) {
+                        refreshUhidButtons()
+                    } else {
+                        injector.mouseDown(cursorX, cursorY, MotionEvent.BUTTON_PRIMARY)
+                    }
                     emit(MapperAction.PRIMARY_HOLD)
                 } else if (release && primaryHeld) {
                     primaryHeld = false
-                    injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_PRIMARY)
+                    if (inputMode == InputMode.UHID) {
+                        refreshUhidButtons()
+                    } else {
+                        injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_PRIMARY)
+                    }
                     emit(MapperAction.PRIMARY_RELEASE)
                 }
             }
@@ -434,11 +547,19 @@ class Mapper(
             MouseAction.RIGHT_HOLD -> {
                 if (press && !secondaryHeld) {
                     secondaryHeld = true
-                    injector.mouseDown(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY)
+                    if (inputMode == InputMode.UHID) {
+                        refreshUhidButtons()
+                    } else {
+                        injector.mouseDown(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY)
+                    }
                     emit(MapperAction.SECONDARY_HOLD)
                 } else if (release && secondaryHeld) {
                     secondaryHeld = false
-                    injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY)
+                    if (inputMode == InputMode.UHID) {
+                        refreshUhidButtons()
+                    } else {
+                        injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY)
+                    }
                     emit(MapperAction.SECONDARY_RELEASE)
                 }
             }
@@ -469,8 +590,10 @@ class Mapper(
     }
 
     private fun step(dt: Float, now: Long) {
-        // 长按判定：A 键按住超过阈值仍未松开 → 光标处按下并进入拖拽态。
-        if (tapKeyActive && !dragging && now - tapKeyDownAt >= config.longPressMs) {
+        val uhid = inputMode == InputMode.UHID
+
+        // 长按拖拽只属于触摸注入后端；UHID 下按住 A 本身就是按住左键。
+        if (!uhid && tapKeyActive && !dragging && now - tapKeyDownAt >= config.longPressMs) {
             dragging = true
             injector.touchDown(cursorX, cursorY)
             emit(MapperAction.DRAG_START, now)
@@ -478,27 +601,65 @@ class Mapper(
 
         val previousX = cursorX
         val previousY = cursorY
+        var moved = false
         if (dt > 0f) {
-            val speed = currentSpeed()
-            if (speed > 0f) {
-                val magnitude = hypot(leftStickX, leftStickY)
-                if (magnitude > 0f) {
-                    cursorX = (cursorX + leftStickX / magnitude * speed * dt)
-                        .coerceIn(0f, screenWidth.toFloat())
-                    cursorY = (cursorY + leftStickY / magnitude * speed * dt)
-                        .coerceIn(0f, screenHeight.toFloat())
-                }
-            }
+            moved = if (uhid) moveUhid(dt) else moveTouch(dt)
             updateScroll(dt)
         }
 
-        if (cursorX == previousX && cursorY == previousY) return
+        if (uhid) {
+            // 系统自己画光标：这里只更新调试坐标，不移动悬浮窗。
+            if (moved) listener?.onCursor(cursorX, cursorY)
+            return
+        }
+
+        if (!moved && cursorX == previousX && cursorY == previousY) return
 
         MouseService.moveTo(cursorX, cursorY)
         if (dragging) injector.touchMove(cursorX, cursorY)
         val buttonState = mouseButtonState()
         if (buttonState != 0) injector.mouseMove(cursorX, cursorY, buttonState)
         listener?.onCursor(cursorX, cursorY)
+    }
+
+    /** 触摸注入：像素/秒 → 绝对坐标。 */
+    private fun moveTouch(dt: Float): Boolean {
+        val speed = currentSpeed()
+        if (speed <= 0f) return false
+        val magnitude = hypot(leftStickX, leftStickY)
+        if (magnitude <= 0f) return false
+        cursorX = (cursorX + leftStickX / magnitude * speed * dt)
+            .coerceIn(0f, screenWidth.toFloat())
+        cursorY = (cursorY + leftStickY / magnitude * speed * dt)
+            .coerceIn(0f, screenHeight.toFloat())
+        return true
+    }
+
+    /**
+     * UHID：像素/秒 → 相对位移。
+     *
+     * 小数部分留在累加器里（慢推不会不动），整数部分立即上报；
+     * 超过 ±127 由 [Injector.uhidMove] 的实现方拆成多次 report。
+     */
+    private fun moveUhid(dt: Float): Boolean {
+        val speed = currentSpeed()
+        if (speed <= 0f) return false
+        val magnitude = hypot(leftStickX, leftStickY)
+        if (magnitude <= 0f) return false
+
+        uhidAccumX += leftStickX / magnitude * speed * dt
+        uhidAccumY += leftStickY / magnitude * speed * dt
+        val dx = uhidAccumX.toInt()
+        val dy = uhidAccumY.toInt()
+        if (dx == 0 && dy == 0) return false
+
+        uhidAccumX -= dx
+        uhidAccumY -= dy
+        // 仅用于调试面板：系统指针不在 App 的控制范围内。
+        cursorX = (cursorX + dx).coerceIn(0f, screenWidth.toFloat())
+        cursorY = (cursorY + dy).coerceIn(0f, screenHeight.toFloat())
+        runCatching { injector.uhidMove(dx, dy) }
+        return true
     }
 
     /** 死区重映射 + 加速曲线：speed = base * ((mag - dz) / (1 - dz))^exponent。 */
@@ -509,23 +670,35 @@ class Mapper(
         return config.speedPxPerSec * remapped.pow(config.exponent)
     }
 
-    /** 右摇杆纵向累积滚动：满 1 格注入一次 scroll，余量保留到下一帧。 */
+    /** 右摇杆纵向累积滚动：满 1 格上报一次，余量保留到下一帧。 */
     private fun updateScroll(dt: Float) {
         if (kotlin.math.abs(rightStickY) <= config.deadzone) {
             scrollAccumulator = 0f
             return
         }
         scrollAccumulator += rightStickY * config.scrollNotchesPerSecond * dt
+
+        var downNotches = 0
         while (scrollAccumulator >= 1f) {
             scrollAccumulator -= 1f
-            injector.scroll(cursorX, cursorY, 0f, 1f)
-            emit(MapperAction.SCROLL_DOWN)
+            downNotches++
         }
         while (scrollAccumulator <= -1f) {
             scrollAccumulator += 1f
-            injector.scroll(cursorX, cursorY, 0f, -1f)
-            emit(MapperAction.SCROLL_UP)
+            downNotches--
         }
+        if (downNotches == 0) return
+
+        if (inputMode == InputMode.UHID) {
+            // HID Wheel 正数 = 向上；触摸注入的 v=+1 = 向下，这里取反保持手感一致。
+            runCatching { injector.uhidWheel(-downNotches) }
+        } else {
+            val v = if (downNotches > 0) 1f else -1f
+            repeat(kotlin.math.abs(downNotches)) {
+                injector.scroll(cursorX, cursorY, 0f, v)
+            }
+        }
+        emit(if (downNotches > 0) MapperAction.SCROLL_DOWN else MapperAction.SCROLL_UP)
     }
 
     private fun mouseButtonState(): Int {
@@ -535,7 +708,8 @@ class Mapper(
         return state
     }
 
-    private fun releaseAll() {
+    /** 补发所有触摸注入的按下状态，避免停服/切后端时卡住。 */
+    private fun resetTouchState() {
         if (dragging) {
             dragging = false
             runCatching { injector.touchUp(cursorX, cursorY) }
@@ -549,6 +723,35 @@ class Mapper(
             runCatching { injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY) }
         }
         tapKeyActive = false
+    }
+
+    /** 按当前按住状态重算 UHID 位掩码；有变化才上报。 */
+    private fun refreshUhidButtons() {
+        var mask = 0
+        if (primaryHeld || uhidTapHeld) mask = mask or MotionEvent.BUTTON_PRIMARY
+        if (secondaryHeld || uhidRightHeld) mask = mask or MotionEvent.BUTTON_SECONDARY
+        if (uhidMiddleHeld) mask = mask or MotionEvent.BUTTON_TERTIARY
+        if (mask == uhidButtons) return
+        uhidButtons = mask
+        runCatching { injector.uhidButton(mask) }
+    }
+
+    private fun releaseAll() {
+        if (inputMode == InputMode.UHID) {
+            uhidTapHeld = false
+            uhidRightHeld = false
+            uhidMiddleHeld = false
+            primaryHeld = false
+            secondaryHeld = false
+            if (uhidButtons != 0) {
+                uhidButtons = 0
+                runCatching { injector.uhidButton(0) }
+            }
+            tapKeyActive = false
+            dragging = false
+        } else {
+            resetTouchState()
+        }
         scrollAccumulator = 0f
     }
 

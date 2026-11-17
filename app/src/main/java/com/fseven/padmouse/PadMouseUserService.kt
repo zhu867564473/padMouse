@@ -51,6 +51,10 @@ class PadMouseUserService : IPadMouse.Stub() {
     private var mouseDownTime = 0L
     private var mouseButtonState = 0
 
+    /** M12：UHID 虚拟鼠标；fd、上报与销毁全部在 shell 进程内。 */
+    private val uhidLock = Any()
+    private var uhidMouse: UhidMouse? = null
+
     override fun tap(x: Float, y: Float) {
         try {
             down(x, y)
@@ -211,6 +215,8 @@ class PadMouseUserService : IPadMouse.Stub() {
             // 停止后回到鼠标模式，下次启动不会残留「游戏模式」。
             mouseMode = true
         }
+        // 捕获停止通常意味着服务收尾：一并销毁虚拟鼠标，避免系统里残留设备。
+        destroyUhidMouse()
     }
 
     /**
@@ -244,9 +250,41 @@ class PadMouseUserService : IPadMouse.Stub() {
             this.mouseMode = mouseMode
             gamepadReader?.setMouseMode(mouseMode)
         }
+        // 游戏模式不允许 UHID 继续占用设备；切回鼠标模式后由 App 重新 create。
+        if (!mouseMode) destroyUhidMouse()
     }
 
     override fun isGameMode(): Boolean = synchronized(gamepadLock) { !mouseMode }
+
+    // ---------------------------------------------------------------- M12 UHID 虚拟鼠标
+
+    override fun createUhidMouse(): String = synchronized(uhidLock) {
+        val mouse = uhidMouse ?: UhidMouse().also { uhidMouse = it }
+        mouse.create()
+    }
+
+    override fun destroyUhidMouse() {
+        synchronized(uhidLock) {
+            uhidMouse?.destroy()
+            uhidMouse = null
+        }
+    }
+
+    override fun uhidMouseMove(dx: Int, dy: Int) {
+        synchronized(uhidLock) { uhidMouse?.move(dx, dy) }
+    }
+
+    override fun uhidMouseButton(buttonMask: Int) {
+        synchronized(uhidLock) { uhidMouse?.setButtons(buttonMask) }
+    }
+
+    override fun uhidMouseWheel(delta: Int) {
+        synchronized(uhidLock) { uhidMouse?.wheel(delta) }
+    }
+
+    override fun uhidStatus(): String = synchronized(uhidLock) {
+        uhidMouse?.status() ?: "active=false (not created)"
+    }
 
     override fun describeGamepads(): String {
         val reader = synchronized(gamepadLock) { gamepadReader }

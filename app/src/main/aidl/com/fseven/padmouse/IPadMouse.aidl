@@ -38,4 +38,18 @@ interface IPadMouse {
     // fd 保持打开，长按热键（BTN_THUMBL）仍可读到来切回。
     void setMouseMode(boolean mouseMode);
     boolean isGameMode();
+
+    // M12 UHID 虚拟鼠标：在 UserService（shell 进程）内打开 /dev/uhid，
+    // 创建系统级 HID 相对鼠标（3 键 + 滚轮，4 字节 report）。
+    // createUhidMouse 返回状态串；成功以 "active=true" 开头，失败以 "ERROR:" 开头。
+    String createUhidMouse();
+    void destroyUhidMouse();
+    // 相对位移（像素）；实现侧按 HID int8 上限 ±127 拆分多次上报。
+    void uhidMouseMove(int dx, int dy);
+    // 按键位掩码：bit0 左键 / bit1 右键 / bit2 中键。
+    void uhidMouseButton(int buttonMask);
+    // 滚轮格数：正数向上、负数向下。
+    void uhidMouseWheel(int delta);
+    // 当前设备状态（active=true ... / active=false / ERROR: ...）。
+    String uhidStatus();
 }

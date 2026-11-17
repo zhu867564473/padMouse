@@ -216,6 +216,19 @@
     <string name="toast_screenshot_failed">截图失败：%1$s</string>
     <string name="toast_screenshot_failed_unknown">未知原因</string>
 
+    <!-- M12 输入模式 / UHID 虚拟鼠标 -->
+    <string name="input_mode_section_title">输入模式</string>
+    <string name="input_mode_uhid">UHID 虚拟鼠标模式（推荐）</string>
+    <string name="input_mode_touch">触摸注入模式（兼容/游戏）</string>
+    <string name="input_mode_hint">UHID 模式由系统绘制光标并处理滚轮，小说/浏览器可直接滚动；触摸注入模式保留旧的自绘光标，部分 App 可能不认滚轮。切换后立即生效。系统设置里的「指针速度」会叠加影响 UHID 手感。</string>
+    <string name="input_mode_status_idle">UHID 鼠标模式（未启动）</string>
+    <string name="input_mode_status_uhid_active">UHID 虚拟鼠标已就绪 · 系统原生光标</string>
+    <string name="input_mode_status_uhid_connecting">UHID 鼠标模式 · 正在创建虚拟鼠标…</string>
+    <string name="input_mode_status_uhid_failed">UHID 创建失败，已回退触摸注入：%1$s</string>
+    <string name="input_mode_status_touch">触摸注入模式 · 自绘光标</string>
+    <string name="cursor_appearance_system_managed">UHID 模式下光标由系统绘制，大小/颜色/自动隐藏改由系统设置控制；切回触摸注入模式后可继续调整。</string>
+    <string name="run_detail_uhid_fallback">UHID 创建失败，已回退触摸注入：%1$s</string>
+
     <!-- 前台服务通知 -->
     <string name="notification_channel_name">手柄鼠标服务</string>
     <string name="notification_text">手柄鼠标运行中 · 摇杆控制光标</string>

@@ -2,6 +2,12 @@ package com.fseven.padmouse
 
 import android.content.Context
 
+/** M12 输入后端：UHID 系统虚拟鼠标 / 旧触摸注入。 */
+enum class InputMode {
+    UHID,
+    TOUCH,
+}
+
 /**
  * M7 设置持久化：光标外观、手感参数、按键绑定统一写入 SharedPreferences。
  *
@@ -42,6 +48,25 @@ class SettingsRepository(context: Context) {
     fun saveCursorIdleSeconds(seconds: Int) {
         prefs.edit()
             .putInt(KEY_CURSOR_IDLE_SECONDS, seconds.coerceIn(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS))
+            .apply()
+    }
+
+    // ---------------------------------------------------------------- M12 输入模式
+
+    /** 输入后端：默认 UHID（系统原生光标 + 原生滚轮）。旧数据/缺失一律按 UHID。 */
+    fun loadInputMode(): InputMode =
+        if (prefs.getString(KEY_INPUT_MODE, null) == VALUE_INPUT_MODE_TOUCH) {
+            InputMode.TOUCH
+        } else {
+            InputMode.UHID
+        }
+
+    fun saveInputMode(mode: InputMode) {
+        prefs.edit()
+            .putString(
+                KEY_INPUT_MODE,
+                if (mode == InputMode.TOUCH) VALUE_INPUT_MODE_TOUCH else VALUE_INPUT_MODE_UHID
+            )
             .apply()
     }
 
@@ -200,6 +225,9 @@ class SettingsRepository(context: Context) {
         private const val KEY_SPEED_PX_PER_SEC = "feel_speed_px_per_sec"
         private const val KEY_ACCEL_EXPONENT = "feel_accel_exponent"
         private const val KEY_EXCLUSIVE_MODE = "gamepad_exclusive_mode"
+        private const val KEY_INPUT_MODE = "input_mode"
+        private const val VALUE_INPUT_MODE_UHID = "uhid"
+        private const val VALUE_INPUT_MODE_TOUCH = "touch"
         private const val KEY_MODE_TOGGLE = "gamepad_mode_toggle_binding"
         private const val KEY_MODE_TOGGLE_MIGRATED = "gamepad_mode_toggle_migrated_v1"
 
