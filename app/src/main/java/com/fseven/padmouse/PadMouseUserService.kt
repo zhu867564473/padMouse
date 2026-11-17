@@ -26,6 +26,15 @@ class PadMouseUserService : IPadMouse.Stub() {
     private val gamepadLock = Any()
     private var gamepadReader: GamepadReader? = null
 
+    /** 保留监听器，独占开关变化时用新配置重建读取器。 */
+    private var gamepadListener: IGamepadListener? = null
+
+    /** 用户设置：独占手柄（默认开启）。 */
+    private var exclusiveMode = true
+
+    /** 当前模式：true = 鼠标模式（独占 + 映射），false = 游戏模式（交还系统）。 */
+    private var mouseMode = true
+
     /** 触摸手势状态，保证 MOVE/UP 复用 DOWN 的 downTime。 */
     private val gestureLock = Any()
     private var pointerDown = false
@@ -179,7 +188,8 @@ class PadMouseUserService : IPadMouse.Stub() {
         val target = listener ?: return
         synchronized(gamepadLock) {
             gamepadReader?.stop()
-            gamepadReader = GamepadReader(target).also { it.start() }
+            gamepadListener = target
+            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode).also { it.start() }
         }
     }
 
@@ -187,8 +197,45 @@ class PadMouseUserService : IPadMouse.Stub() {
         synchronized(gamepadLock) {
             gamepadReader?.stop()
             gamepadReader = null
+            gamepadListener = null
+            // 停止后回到鼠标模式，下次启动不会残留「游戏模式」。
+            mouseMode = true
         }
     }
+
+    /**
+     * 设置独占开关：读取器必须重建（先 ungrab 关闭旧 fd，再按新配置重开）。
+     * 运行中的映射不受影响，只有抓取行为变化。
+     */
+    override fun setExclusiveMode(enabled: Boolean) {
+        synchronized(gamepadLock) {
+            if (exclusiveMode == enabled) return
+            exclusiveMode = enabled
+            val target = gamepadListener ?: return
+            gamepadReader?.stop()
+            gamepadReader = GamepadReader(target, exclusiveMode, mouseMode).also { it.start() }
+        }
+    }
+
+    override fun isExclusiveActive(): Boolean {
+        val reader = synchronized(gamepadLock) { gamepadReader } ?: return false
+        return reader.isExclusiveActive()
+    }
+
+    override fun getExclusiveError(): String {
+        val reader = synchronized(gamepadLock) { gamepadReader } ?: return ""
+        return reader.exclusiveError() ?: ""
+    }
+
+    /** 鼠标模式 / 游戏模式切换：只释放或恢复 EVIOCGRAB，fd 始终保持打开。 */
+    override fun setMouseMode(mouseMode: Boolean) {
+        synchronized(gamepadLock) {
+            this.mouseMode = mouseMode
+            gamepadReader?.setMouseMode(mouseMode)
+        }
+    }
+
+    override fun isGameMode(): Boolean = synchronized(gamepadLock) { !mouseMode }
 
     override fun describeGamepads(): String {
         val reader = synchronized(gamepadLock) { gamepadReader }

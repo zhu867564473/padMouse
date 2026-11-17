@@ -162,6 +162,17 @@ class ShizukuServiceManager(
 
     fun describeGamepads(): String = requireService().describeGamepads()
 
+    // M10 手柄独占 / 模式切换：全部转发到 UserService（shell 侧持有 fd 与 EVIOCGRAB）。
+    fun setExclusiveMode(enabled: Boolean) = requireService().setExclusiveMode(enabled)
+
+    fun isExclusiveActive(): Boolean = requireService().isExclusiveActive()
+
+    fun getExclusiveError(): String = requireService().getExclusiveError()
+
+    fun setMouseMode(mouseMode: Boolean) = requireService().setMouseMode(mouseMode)
+
+    fun isGameMode(): Boolean = requireService().isGameMode()
+
     private fun requireService(): IPadMouse =
         service ?: throw IllegalStateException("UserService 未连接，请先完成 Shizuku 授权")
 

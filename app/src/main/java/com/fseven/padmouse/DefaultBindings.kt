@@ -32,6 +32,9 @@ object DefaultBindings {
     /** 系统动作防误触：同一动作触发后该时间内不重复触发。 */
     const val SYSTEM_ACTION_DEBOUNCE_MS = 200L
 
+    /** M10 模式切换热键：长按该时间（短按不动作）。 */
+    const val MODE_TOGGLE_LONG_PRESS_MS = 800L
+
     /**
      * 组合键判定窗口：参与组合的键按下后先等这么久，
      * 期间组合成立则只触发组合动作，否则补发单键动作。
@@ -81,10 +84,10 @@ object DefaultBindings {
     )
 
     /**
-     * M6 系统动作默认绑定（Xbox 布局）：
+     * M6 系统动作默认绑定（Xbox 布局），M10 调整：
      * - Start → Home，Select → Back，Xbox 键 → Recents
-     * - 左摇杆按下 → 音量减，右摇杆按下 → 音量加
-     * - 十字键上/下 → 亮度加/减（ABS_HAT0Y 为数字轴）
+     * - 十字键左/右（ABS_HAT0X）→ 音量减/加（L3 让位给模式切换热键）
+     * - 十字键上/下（ABS_HAT0Y）→ 亮度加/减（数字轴）
      * - LB+RB 同时按下 → 截图
      *
      * 单独按 LB/RB 仍是滚轮上/下；组合判定窗口见 [CHORD_GRACE_MS]。
@@ -93,10 +96,16 @@ object DefaultBindings {
         SystemAction.BACK to ActionBinding(BTN_SELECT),
         SystemAction.HOME to ActionBinding(BTN_START),
         SystemAction.RECENTS to ActionBinding(BTN_MODE),
-        SystemAction.VOLUME_DOWN to ActionBinding(BTN_THUMBL),
-        SystemAction.VOLUME_UP to ActionBinding(BTN_THUMBR),
+        SystemAction.VOLUME_DOWN to ActionBinding(AXIS_HAT0X, direction = -1),
+        SystemAction.VOLUME_UP to ActionBinding(AXIS_HAT0X, direction = 1),
         SystemAction.BRIGHTNESS_UP to ActionBinding(AXIS_HAT0Y, direction = -1),
         SystemAction.BRIGHTNESS_DOWN to ActionBinding(AXIS_HAT0Y, direction = 1),
         SystemAction.SCREENSHOT to ActionBinding(BTN_TL, chordCode = BTN_TR),
     )
+
+    /**
+     * M10 模式切换热键默认绑定：长按左摇杆按下 800ms。
+     * 该绑定不允许清空（否则切到游戏模式后无法用手柄切回）。
+     */
+    val MODE_TOGGLE_BINDING: ActionBinding = ActionBinding(BTN_THUMBL)
 }

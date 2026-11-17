@@ -23,4 +23,16 @@ interface IPadMouse {
     void startGamepadCapture(IGamepadListener listener);
     void stopGamepadCapture();
     String describeGamepads();
+
+    // M10 手柄独占：EVIOCGRAB 抢占设备，系统输入层不再派发该手柄事件。
+    // 开关变化会重建读取器（先 ungrab 关闭旧 fd，再按新配置重开）。
+    void setExclusiveMode(boolean enabled);
+    boolean isExclusiveActive();
+    // 独占失败原因；成功/未启用时返回空串。
+    String getExclusiveError();
+
+    // 鼠标模式(true) / 游戏模式(false)：游戏模式只 EVIOCGRAB 0 释放设备，
+    // fd 保持打开，长按热键（BTN_THUMBL）仍可读到来切回。
+    void setMouseMode(boolean mouseMode);
+    boolean isGameMode();
 }

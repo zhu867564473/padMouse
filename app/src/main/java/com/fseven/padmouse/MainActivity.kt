@@ -24,6 +24,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.card.MaterialCardView
+import com.google.android.material.switchmaterial.SwitchMaterial
 import rikka.shizuku.Shizuku
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -87,9 +88,15 @@ class MainActivity : AppCompatActivity() {
 
     // 三、手柄
     private lateinit var gamepadSummary: TextView
+    private lateinit var gamepadModeValue: TextView
     private lateinit var gamepadAxes: TextView
     private lateinit var gamepadEvents: TextView
     private lateinit var gamepadRefreshButton: Button
+
+    // M10 独占：开关 + 模式切换热键
+    private lateinit var exclusiveSwitch: SwitchMaterial
+    private lateinit var modeToggleSpinner: Spinner
+    private var modeToggleBinding: ActionBinding = DefaultBindings.MODE_TOGGLE_BINDING
 
     // 四、设置：光标外观
     private lateinit var cursorSizeSeek: SeekBar
@@ -205,6 +212,7 @@ class MainActivity : AppCompatActivity() {
         mappingVectorValue = findViewById(R.id.mapping_vector_value)
         mappingActionValue = findViewById(R.id.mapping_action_value)
         gamepadSummary = findViewById(R.id.gamepad_summary)
+        gamepadModeValue = findViewById(R.id.gamepad_mode_value)
         gamepadAxes = findViewById(R.id.gamepad_axes)
         gamepadEvents = findViewById(R.id.gamepad_events)
         gamepadRefreshButton = findViewById(R.id.button_refresh_gamepad)
@@ -219,6 +227,8 @@ class MainActivity : AppCompatActivity() {
         feelDeadzoneValue = findViewById(R.id.feel_deadzone_value)
         feelExponentSeek = findViewById(R.id.seek_feel_exponent)
         feelExponentValue = findViewById(R.id.feel_exponent_value)
+        exclusiveSwitch = findViewById(R.id.switch_exclusive_mode)
+        modeToggleSpinner = findViewById(R.id.spinner_mode_toggle)
 
         settingsRepository = SettingsRepository(this)
 
@@ -243,6 +253,8 @@ class MainActivity : AppCompatActivity() {
         runToggleButton.setOnClickListener { setCursorEnabled(!MouseService.isRunning) }
 
         setupSystemBindings()
+        setupModeToggleBinding()
+        setupExclusiveControls()
         setupCursorControls()
         setupFeelControls()
 
@@ -931,6 +943,17 @@ class MainActivity : AppCompatActivity() {
         if (!summary.isNullOrBlank()) {
             if (gamepadSummary.text != summary) gamepadSummary.text = summary
         }
+        // M10：设备名之外再显示独占/模式状态，独占失败必须可见。
+        val modeText = when {
+            !MouseService.isRunning -> getString(R.string.gamepad_mode_idle)
+            MouseService.gameMode -> getString(R.string.gamepad_mode_game)
+            MouseService.exclusiveError != null ->
+                getString(R.string.gamepad_mode_exclusive_failed, MouseService.exclusiveError ?: "")
+
+            MouseService.exclusiveActive -> getString(R.string.gamepad_mode_exclusive)
+            else -> getString(R.string.gamepad_mode_listen)
+        }
+        if (gamepadModeValue.text != modeText) gamepadModeValue.text = modeText
         val axes = MouseRuntime.axesSnapshot().sortedBy { it.first }
         gamepadAxes.text = if (axes.isEmpty()) {
             getString(R.string.gamepad_axes_idle)
@@ -1241,6 +1264,85 @@ class MainActivity : AppCompatActivity() {
         pushMapperConfig()
     }
 
+    // ---------------------------------------------------------------- M10 独占 / 模式热键
+
+    /** 独占手柄开关：持久化后通知服务按新配置重建读取器（立即生效）。 */
+    private fun setupExclusiveControls() {
+        exclusiveSwitch.isChecked = settingsRepository.loadExclusiveMode()
+        exclusiveSwitch.setOnCheckedChangeListener { _, checked ->
+            settingsRepository.saveExclusiveMode(checked)
+            pushExclusiveMode()
+        }
+    }
+
+    private fun pushExclusiveMode() {
+        if (!MouseService.isRunning) return
+        try {
+            startService(
+                Intent(this, MouseService::class.java)
+                    .setAction(MouseService.ACTION_UPDATE_EXCLUSIVE)
+            )
+        } catch (_: Throwable) {
+            // 服务可能刚好停止；设置已持久化，下次启动生效。
+        }
+    }
+
+    /**
+     * 「切换鼠标/游戏模式」热键：长按 800ms 触发。
+     * 候选项只有实体按键、没有「无」——不允许清空，否则切到游戏模式后不便切回。
+     */
+    private fun setupModeToggleBinding() {
+        modeToggleBinding = settingsRepository.loadModeToggleBinding()
+        val options = modeToggleOptions()
+        val labels = options.map { getString(it.labelRes) }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        modeToggleSpinner.adapter = adapter
+        modeToggleSpinner.setSelection(
+            options.indexOfFirst { it.binding == modeToggleBinding }.coerceAtLeast(0),
+            false
+        )
+        modeToggleSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: View?,
+                position: Int,
+                id: Long
+            ) {
+                val option = options.getOrNull(position) ?: return
+                if (modeToggleBinding == option.binding) return
+                modeToggleBinding = option.binding
+                settingsRepository.saveModeToggleBinding(option.binding)
+                pushMapperConfig()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(R.string.mode_toggle_saved, getString(option.labelRes)),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    /** 模式切换热键候选项：只列按键，不含轴/组合/清空。 */
+    private fun modeToggleOptions(): List<BindingOption> = listOf(
+        BindingOption(ActionBinding(DefaultBindings.BTN_THUMBL), R.string.system_bind_thumbl),
+        BindingOption(ActionBinding(DefaultBindings.BTN_THUMBR), R.string.system_bind_thumbr),
+        BindingOption(ActionBinding(DefaultBindings.BTN_START), R.string.system_bind_start),
+        BindingOption(ActionBinding(DefaultBindings.BTN_SELECT), R.string.system_bind_select),
+        BindingOption(ActionBinding(DefaultBindings.BTN_MODE), R.string.system_bind_mode),
+        BindingOption(ActionBinding(DefaultBindings.BTN_TL), R.string.system_bind_tl),
+        BindingOption(ActionBinding(DefaultBindings.BTN_TR), R.string.system_bind_tr),
+        BindingOption(ActionBinding(DefaultBindings.BTN_A), R.string.system_bind_a),
+        BindingOption(ActionBinding(DefaultBindings.BTN_B), R.string.system_bind_b),
+        BindingOption(ActionBinding(DefaultBindings.BTN_X), R.string.system_bind_x),
+        BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_UP), R.string.system_bind_dpad_up),
+        BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_DOWN), R.string.system_bind_dpad_down),
+        BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_LEFT), R.string.system_bind_dpad_left),
+        BindingOption(ActionBinding(DefaultBindings.BTN_DPAD_RIGHT), R.string.system_bind_dpad_right),
+    )
+
     private fun systemActionLabelRes(action: SystemAction): Int = when (action) {
         SystemAction.BACK -> R.string.system_action_back
         SystemAction.HOME -> R.string.system_action_home
@@ -1257,7 +1359,10 @@ class MainActivity : AppCompatActivity() {
     /** 映射运行在 MouseService 内；这里只做状态展示。 */
     private fun renderMappingStatus() {
         if (!MouseRuntime.mappingRunning) {
-            mappingStatus.setText(R.string.mapping_status_idle)
+            mappingStatus.setText(
+                if (MouseService.gameMode) R.string.mapping_status_game_mode
+                else R.string.mapping_status_idle
+            )
             return
         }
         val config = MouseRuntime.mapperConfig ?: MapperConfig()

@@ -95,10 +95,16 @@
     <string name="gamepad_events_idle">按键事件将显示在这里。</string>
     <string name="gamepad_key_event">%1$s  code=%2$d  value=%3$d</string>
     <string name="gamepad_toast_not_ready">UserService 尚未就绪，无法读取手柄</string>
+    <string name="gamepad_mode_idle">模式：未运行</string>
+    <string name="gamepad_mode_exclusive">模式：鼠标模式 · 独占中（前台 App 不会收到手柄事件）</string>
+    <string name="gamepad_mode_listen">模式：鼠标模式 · 旁听中（未独占）</string>
+    <string name="gamepad_mode_game">模式：游戏模式（已交还系统，光标隐藏、不注入）</string>
+    <string name="gamepad_mode_exclusive_failed">模式：鼠标模式 · 独占失败：%1$s</string>
 
     <!-- 映射实时状态 -->
     <string name="mapping_card_title">实时状态（调试）</string>
     <string name="mapping_status_idle">映射未启动：启动手柄鼠标后自动启用。</string>
+    <string name="mapping_status_game_mode">游戏模式：映射已暂停，长按模式热键（默认 L3 800ms）切回鼠标模式。</string>
     <string name="mapping_status_running">映射运行中 · 死区 %1$.2f · 速度 %2$d px/s · 曲线 %3$.1f</string>
     <string name="mapping_cursor_idle">光标: -</string>
     <string name="mapping_cursor_value">光标: (%1$.0f, %2$.0f)</string>
@@ -153,10 +159,15 @@
     <string name="feel_exponent_value">%1$.1f</string>
     <string name="feel_hint">死区越大越防误触；指数越大越接近「慢推精细、快推加速」的曲线。改动即时生效并保存。</string>
 
-    <string name="binding_section_title">按键绑定（系统动作）</string>
+    <string name="binding_section_title">按键绑定（系统动作 / 模式热键）</string>
+    <string name="exclusive_mode_label">独占手柄（当鼠标时不被前台 App 抢事件）</string>
+    <string name="exclusive_mode_hint">默认开启：用 EVIOCGRAB 抢占设备，系统输入层不再派发，前台 App 不会同时响应手柄。关闭后恢复旁听（双响应），需要玩原生手柄游戏时可临时关闭。改动会重建读取器并立即生效。</string>
+    <string name="mode_toggle_label">切换模式热键（长按 800ms）</string>
+    <string name="mode_toggle_hint">长按在「鼠标模式 / 游戏模式」间切换，切换时震动一次，短按不动作。不允许清空：没有热键会导致切到游戏模式后不便切回。游戏模式下设备交还系统，光标隐藏且不注入。</string>
+    <string name="mode_toggle_saved">已保存：长按 %1$s 切换模式</string>
     <string name="system_card_title">系统动作绑定</string>
     <string name="system_card_hint">为每个动作选择手柄按键，改动即时生效并保存；同一动作 200ms 内只触发一次。</string>
-    <string name="system_card_defaults_hint">默认：Start→Home · Select→Back · Xbox 键→最近任务 · 左摇杆按下→音量减 · 右摇杆按下→音量加 · 十字键上/下→亮度加/减 · LB+RB 同时按→截图</string>
+    <string name="system_card_defaults_hint">默认：Start→Home · Select→Back · Xbox 键→最近任务 · 十字键左/右→音量减/加 · 十字键上/下→亮度加/减 · LB+RB 同时按→截图 · 长按左摇杆按下 800ms→切换鼠标/游戏模式</string>
     <string name="system_action_back">返回 Back</string>
     <string name="system_action_home">主屏 Home</string>
     <string name="system_action_recents">最近任务 Recents</string>

@@ -15,6 +15,7 @@ class SettingsRepository(context: Context) {
 
     init {
         migrateLegacyCursorPrefs()
+        migrateModeToggleDefaults()
     }
 
     // ---------------------------------------------------------------- 光标外观
@@ -42,6 +43,29 @@ class SettingsRepository(context: Context) {
         prefs.edit()
             .putInt(KEY_CURSOR_IDLE_SECONDS, seconds.coerceIn(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS))
             .apply()
+    }
+
+    // ---------------------------------------------------------------- M10 手柄独占 / 模式切换
+
+    /** 独占手柄（当鼠标时不被前台 App 抢事件）：默认开启。 */
+    fun loadExclusiveMode(): Boolean = prefs.getBoolean(KEY_EXCLUSIVE_MODE, true)
+
+    fun saveExclusiveMode(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_EXCLUSIVE_MODE, enabled).apply()
+    }
+
+    /**
+     * 模式切换热键（长按切换鼠标/游戏模式）。
+     * 不允许清空：空值、轴绑定或组合键一律回退默认 L3，避免切到游戏模式后无法用热键切回。
+     */
+    fun loadModeToggleBinding(): ActionBinding =
+        ActionBinding.decode(prefs.getString(KEY_MODE_TOGGLE, null))
+            ?.takeIf { it.direction == 0 && !it.isChord }
+            ?: DefaultBindings.MODE_TOGGLE_BINDING
+
+    fun saveModeToggleBinding(binding: ActionBinding) {
+        if (binding.direction != 0 || binding.isChord) return
+        prefs.edit().putString(KEY_MODE_TOGGLE, binding.encode()).apply()
     }
 
     // ---------------------------------------------------------------- 手感参数
@@ -106,10 +130,34 @@ class SettingsRepository(context: Context) {
     fun resetSystemBindings() {
         val editor = prefs.edit()
         for (action in SystemAction.values()) editor.remove(keyOf(action))
+        editor.remove(KEY_MODE_TOGGLE)
         editor.apply()
     }
 
     private fun keyOf(action: SystemAction): String = "system_action_${action.name.lowercase()}"
+
+    /**
+     * M10：L3 由「音量减」让位给模式切换热键，音量改绑十字键左右。
+     * 只在旧默认值原样存在时迁移，避免覆盖用户自定义。
+     */
+    private fun migrateModeToggleDefaults() {
+        if (prefs.getBoolean(KEY_MODE_TOGGLE_MIGRATED, false)) return
+        val editor = prefs.edit()
+        val legacy = mapOf(
+            SystemAction.VOLUME_DOWN to ActionBinding(DefaultBindings.BTN_THUMBL),
+            SystemAction.VOLUME_UP to ActionBinding(DefaultBindings.BTN_THUMBR),
+        )
+        for ((action, old) in legacy) {
+            val stored = ActionBinding.decode(prefs.getString(keyOf(action), null))
+            if (stored == old) {
+                DefaultBindings.SYSTEM_ACTIONS[action]?.let {
+                    editor.putString(keyOf(action), it.encode())
+                }
+            }
+        }
+        editor.putBoolean(KEY_MODE_TOGGLE_MIGRATED, true)
+        editor.apply()
+    }
 
     /**
      * M4 使用独立的 `cursor_settings` 文件；升级到 M7 后统一到本仓库。
@@ -151,6 +199,9 @@ class SettingsRepository(context: Context) {
         private const val KEY_DEADZONE = "feel_deadzone"
         private const val KEY_SPEED_PX_PER_SEC = "feel_speed_px_per_sec"
         private const val KEY_ACCEL_EXPONENT = "feel_accel_exponent"
+        private const val KEY_EXCLUSIVE_MODE = "gamepad_exclusive_mode"
+        private const val KEY_MODE_TOGGLE = "gamepad_mode_toggle_binding"
+        private const val KEY_MODE_TOGGLE_MIGRATED = "gamepad_mode_toggle_migrated_v1"
 
         const val MIN_IDLE_SECONDS = 1
         const val MAX_IDLE_SECONDS = 10

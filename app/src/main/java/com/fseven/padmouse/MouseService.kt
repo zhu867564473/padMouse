@@ -16,6 +16,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
@@ -77,6 +79,32 @@ class MouseService : Service() {
     private var engineStartAttempts = 0
 
     private var rebindScheduled = false
+
+    // ---------------------------------------------------------------- M10 独占 / 模式
+
+    /** 游戏模式：设备已交还系统，不抓取、不映射、不注入。 */
+    private var inGameMode = false
+
+    /** 进入游戏模式前的光标位置，切回鼠标模式时原位恢复。 */
+    private var savedCursorX = 0f
+    private var savedCursorY = 0f
+
+    /** 游戏模式下窗口 alpha 归零，避免残留光标。 */
+    private var overlayHidden = false
+
+    /** 模式切换热键绑定（缓存，避免每个按键事件都读 SharedPreferences）。 */
+    private var modeToggleBinding: ActionBinding = DefaultBindings.MODE_TOGGLE_BINDING
+
+    /** 长按判定：按下后延时触发，松开取消（短按不动作）。 */
+    private val modeToggleRunnable = Runnable { toggleMouseMode() }
+
+    /** 独占状态轮询；Binder 查询放到注入线程，避免阻塞主线程。 */
+    private val exclusiveStatusPoller = object : Runnable {
+        override fun run() {
+            refreshExclusiveStatus()
+            handler.postDelayed(this, EXCLUSIVE_POLL_MS)
+        }
+    }
 
     /** 窗口级透明度动画；同时决定输入使用的 opacity。 */
     private var windowAlphaAnimator: ValueAnimator? = null
@@ -165,7 +193,11 @@ class MouseService : Service() {
         override fun onEvent(type: Int, code: Int, value: Int) {
             if (type != EV_KEY) return
             MouseRuntime.addKeyEvent(code, value, SystemClock.uptimeMillis())
-            handler.post { if (mapper.isRunning) mapper.onKey(code, value) }
+            handler.post {
+                // 模式切换热键优先消费：游戏模式下映射已停，仍能靠这里切回。
+                if (handleModeToggleKey(code, value)) return@post
+                if (mapper.isRunning) mapper.onKey(code, value)
+            }
         }
 
         override fun onAxis(code: Int, normalized: Float) {
@@ -197,6 +229,7 @@ class MouseService : Service() {
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         settingsRepository = SettingsRepository(this)
+        modeToggleBinding = settingsRepository.loadModeToggleBinding()
         systemActions = SystemActions { command -> serviceManager.shellExec(command) }
         createNotificationChannel()
 
@@ -218,6 +251,11 @@ class MouseService : Service() {
 
             ACTION_UPDATE_CONFIG -> {
                 reloadMapperConfig()
+                return START_NOT_STICKY
+            }
+
+            ACTION_UPDATE_EXCLUSIVE -> {
+                applyExclusiveSetting()
                 return START_NOT_STICKY
             }
 
@@ -315,6 +353,14 @@ class MouseService : Service() {
         if (cursorView == null || !serviceManager.isReady) return
 
         MouseRuntime.setStage(RunStage.READING_GAMEPAD)
+        // 每次启动都从鼠标模式开始：光标可见、设备重新抓取。
+        if (inGameMode) {
+            inGameMode = false
+            MouseService.setGameModeState(false)
+        }
+        setOverlayVisible(true)
+        // UserService 进程是 daemon，模式状态会跨服务重启保留；启动时强制回到鼠标模式。
+        runCatching { serviceManager.setMouseMode(true) }
         if (!startGamepadCapture()) {
             MouseRuntime.setStage(
                 RunStage.FAILED,
@@ -324,6 +370,8 @@ class MouseService : Service() {
         }
 
         refreshScreenBounds()
+        handler.removeCallbacks(exclusiveStatusPoller)
+        handler.postDelayed(exclusiveStatusPoller, EXCLUSIVE_POLL_MS)
         // 留出「正在读取手柄…」的可见时间，同时确认服务没有被中途停止。
         handler.postDelayed({
             if (cursorView == null || !serviceManager.isReady) return@postDelayed
@@ -341,6 +389,9 @@ class MouseService : Service() {
     private fun startGamepadCapture(): Boolean {
         if (gamepadCaptureStarted) return true
         return try {
+            // 先下发独占开关：UserService 用该配置创建读取器（打开即 EVIOCGRAB）。
+            runCatching { serviceManager.setExclusiveMode(settingsRepository.loadExclusiveMode()) }
+            modeToggleBinding = settingsRepository.loadModeToggleBinding()
             serviceManager.startGamepadCapture(gamepadListener)
             gamepadCaptureStarted = true
             true
@@ -353,12 +404,19 @@ class MouseService : Service() {
 
     /** 停映射与手柄监听；服务本身可以继续存活等待重连。 */
     private fun stopMappingEngine() {
+        handler.removeCallbacks(modeToggleRunnable)
+        handler.removeCallbacks(exclusiveStatusPoller)
         if (gamepadCaptureStarted) {
+            // reader.stop() 内部对每个 fd 先 EVIOCGRAB 0 再关闭，系统立即恢复接收。
             runCatching { serviceManager.stopGamepadCapture() }
             gamepadCaptureStarted = false
         }
         if (::mapper.isInitialized && mapper.isRunning) mapper.stop()
         MouseRuntime.mappingRunning = false
+        inGameMode = false
+        setOverlayVisible(true)
+        MouseService.setGameModeState(false)
+        MouseService.setExclusiveState(false, null)
     }
 
     private fun onUserServiceStateChanged(state: UserServiceState) {
@@ -406,6 +464,7 @@ class MouseService : Service() {
     /** Activity 修改手感/绑定时通过 [applyConfig] 热更新。 */
     private fun applyMapperConfig(config: MapperConfig) {
         if (!::mapper.isInitialized) return
+        modeToggleBinding = settingsRepository.loadModeToggleBinding()
         mapper.updateConfig(config)
         MouseRuntime.mapperConfig = mapper.configSnapshot
         MouseRuntime.notifyChanged()
@@ -584,12 +643,15 @@ class MouseService : Service() {
 
     private fun moveToInternal(x: Float, y: Float) {
         if (cursorView == null) return
+        // 游戏模式：光标隐藏且不注入，忽略任何移动请求。
+        if (overlayHidden) return
         applyPosition(x, y, updateLayout = true)
         showCursorNow()
     }
 
     private fun showCursorNow() {
         if (cursorView == null) return
+        if (overlayHidden) return
         handler.removeCallbacks(idleHideRunnable)
         animateWindowAlpha(ACTIVE_WINDOW_ALPHA, FADE_IN_MS)
         scheduleIdleHide()
@@ -639,6 +701,117 @@ class MouseService : Service() {
     private fun schedulePermissionWatchdog() {
         handler.removeCallbacks(permissionWatchdog)
         handler.postDelayed(permissionWatchdog, PERMISSION_CHECK_INTERVAL_MS)
+    }
+
+    // ---------------------------------------------------------------- M10 独占 / 模式切换
+
+    /**
+     * 模式切换热键：命中绑定且按下时开始 [DefaultBindings.MODE_TOGGLE_LONG_PRESS_MS] 计时，
+     * 松开取消（短按不动作）。返回 true 表示事件已被消费，不再交给映射引擎。
+     */
+    private fun handleModeToggleKey(code: Int, value: Int): Boolean {
+        val binding = modeToggleBinding
+        if (binding.direction != 0 || binding.isChord || binding.code != code) return false
+        when (value) {
+            1 -> {
+                handler.removeCallbacks(modeToggleRunnable)
+                handler.postDelayed(modeToggleRunnable, DefaultBindings.MODE_TOGGLE_LONG_PRESS_MS)
+            }
+
+            0 -> handler.removeCallbacks(modeToggleRunnable)
+        }
+        return true
+    }
+
+    private fun toggleMouseMode() {
+        if (cursorView == null) return
+        if (inGameMode) leaveGameMode() else enterGameMode()
+    }
+
+    /** 鼠标模式 → 游戏模式：释放抓取、停映射、隐藏光标，不注入任何事件。 */
+    private fun enterGameMode() {
+        if (inGameMode) return
+        inGameMode = true
+        savedCursorX = cursorX
+        savedCursorY = cursorY
+        vibrateOnce()
+        if (::mapper.isInitialized && mapper.isRunning) mapper.stop()
+        MouseRuntime.mappingRunning = false
+        // 只 ungrab，不关闭 fd：热键仍能读到来切回。
+        runCatching { serviceManager.setMouseMode(false) }
+        setOverlayVisible(false)
+        MouseService.setGameModeState(true)
+        MouseRuntime.notifyChanged()
+        refreshExclusiveStatus()
+    }
+
+    /** 游戏模式 → 鼠标模式：重新 EVIOCGRAB，映射与光标回到切换前的位置。 */
+    private fun leaveGameMode() {
+        if (!inGameMode) return
+        inGameMode = false
+        vibrateOnce()
+        runCatching { serviceManager.setMouseMode(true) }
+        applyPosition(savedCursorX, savedCursorY, updateLayout = true)
+        setOverlayVisible(true)
+        if (::mapper.isInitialized && !mapper.isRunning && cursorView != null) {
+            mapper.updateConfig(currentConfig())
+            mapper.start(screenWidth, screenHeight)
+        }
+        MouseRuntime.mappingRunning = ::mapper.isInitialized && mapper.isRunning
+        MouseService.setGameModeState(false)
+        MouseRuntime.notifyChanged()
+        refreshExclusiveStatus()
+    }
+
+    /** 游戏模式隐藏光标：窗口 alpha 归零（保留视图），切回时原位淡入。 */
+    private fun setOverlayVisible(visible: Boolean) {
+        overlayHidden = !visible
+        val params = layoutParams ?: return
+        val view = cursorView ?: return
+        windowAlphaAnimator?.cancel()
+        windowAlphaAnimator = null
+        if (visible) {
+            params.alpha = ACTIVE_WINDOW_ALPHA
+            scheduleIdleHide()
+        } else {
+            handler.removeCallbacks(idleHideRunnable)
+            params.alpha = 0f
+        }
+        if (overlayAdded && view.isAttachedToWindow) {
+            runCatching { windowManager.updateViewLayout(view, params) }
+        }
+    }
+
+    private fun vibrateOnce() {
+        val vibrator = getSystemService(Vibrator::class.java) ?: return
+        if (!vibrator.hasVibrator()) return
+        runCatching {
+            vibrator.vibrate(
+                VibrationEffect.createOneShot(VIBRATE_MS, VibrationEffect.DEFAULT_AMPLITUDE)
+            )
+        }
+    }
+
+    /** 拉取独占状态（Binder 调用放注入线程），界面据此显示「独占中/旁听中/独占失败」。 */
+    private fun refreshExclusiveStatus() {
+        if (!serviceManager.isReady) {
+            MouseService.setExclusiveState(false, null)
+            return
+        }
+        dispatchInjection {
+            val active = runCatching { serviceManager.isExclusiveActive() }.getOrDefault(false)
+            val error = runCatching { serviceManager.getExclusiveError() }.getOrNull()
+                ?.takeIf { it.isNotBlank() }
+            handler.post { MouseService.setExclusiveState(active, error) }
+        }
+    }
+
+    /** 独占开关变化：按新配置重建读取器（先 ungrab 关闭旧 fd，再重开）。 */
+    private fun applyExclusiveSetting() {
+        modeToggleBinding = settingsRepository.loadModeToggleBinding()
+        if (!gamepadCaptureStarted || !serviceManager.isReady) return
+        runCatching { serviceManager.setExclusiveMode(settingsRepository.loadExclusiveMode()) }
+        refreshExclusiveStatus()
     }
 
     // ---------------------------------------------------------------- 权限自检
@@ -744,6 +917,7 @@ class MouseService : Service() {
         const val ACTION_START = "com.fseven.padmouse.action.START_CURSOR"
         const val ACTION_UPDATE = "com.fseven.padmouse.action.UPDATE_CURSOR"
         const val ACTION_UPDATE_CONFIG = "com.fseven.padmouse.action.UPDATE_CONFIG"
+        const val ACTION_UPDATE_EXCLUSIVE = "com.fseven.padmouse.action.UPDATE_EXCLUSIVE"
         const val ACTION_STOP = "com.fseven.padmouse.action.STOP_CURSOR"
 
         const val EXTRA_SIZE_DP = "extra_size_dp"
@@ -779,11 +953,37 @@ class MouseService : Service() {
         private const val MAX_ENGINE_START_ATTEMPTS = 24
         private const val REBIND_DELAY_MS = 1000L
         private const val MAX_REBIND_ATTEMPTS = 5
+        private const val EXCLUSIVE_POLL_MS = 1_500L
+        private const val VIBRATE_MS = 60L
 
         /** 服务/光标是否在运行，供主界面同步开关状态。 */
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        /** 至少一台设备已被 EVIOCGRAB 独占。 */
+        @Volatile
+        var exclusiveActive: Boolean = false
+            private set
+
+        /** 独占失败原因；成功或未启用时为 null。 */
+        @Volatile
+        var exclusiveError: String? = null
+            private set
+
+        /** 当前是否处于游戏模式（设备已交还系统）。 */
+        @Volatile
+        var gameMode: Boolean = false
+            private set
+
+        fun setExclusiveState(active: Boolean, error: String?) {
+            exclusiveActive = active
+            exclusiveError = error
+        }
+
+        fun setGameModeState(enabled: Boolean) {
+            gameMode = enabled
+        }
 
         @Volatile
         private var instance: MouseService? = null

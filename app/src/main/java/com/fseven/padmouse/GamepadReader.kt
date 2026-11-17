@@ -4,6 +4,7 @@ import android.os.FileObserver
 import android.os.ParcelFileDescriptor
 import android.system.Os
 import android.system.OsConstants
+import android.util.Log
 import java.io.File
 import java.io.FileDescriptor
 import java.io.FileInputStream
@@ -18,7 +19,13 @@ import java.util.concurrent.TimeUnit
  * 数据来源是 /dev/input/eventX，而不是 Activity 的按键焦点，因此不会抢占前台焦点。
  * 每个手柄用独立线程阻塞读取 24 字节 input_event；监控线程负责扫描设备、热插拔与读失败后重连。
  */
-class GamepadReader(private val listener: IGamepadListener?) {
+class GamepadReader(
+    private val listener: IGamepadListener?,
+    /** M10：打开设备后是否立刻 EVIOCGRAB 独占（系统输入层不再派发）。 */
+    exclusive: Boolean = true,
+    /** 鼠标模式 = 独占 + 映射；游戏模式 = 释放抓取但 fd 保持打开（热键仍可读）。 */
+    mouseMode: Boolean = true,
+) {
 
     private val scanLock = Any()
     private val sessionLock = Any()
@@ -28,6 +35,15 @@ class GamepadReader(private val listener: IGamepadListener?) {
     @Volatile private var refreshRequested = false
     @Volatile private var lastSummary: String = ""
     @Volatile private var lastScanError: String? = null
+
+    /** 独占开关（用户设置）；关闭后行为退回旁听。 */
+    @Volatile private var exclusiveEnabled: Boolean = exclusive
+
+    /** true = 鼠标模式，false = 游戏模式（不抓取，事件交给系统）。 */
+    @Volatile private var mouseMode: Boolean = mouseMode
+
+    /** 最近一次抓取失败的原因；没有失败时为 null。 */
+    @Volatile private var exclusiveFailure: String? = null
 
     private var monitorThread: Thread? = null
     private var fileObserver: FileObserver? = null
@@ -59,6 +75,40 @@ class GamepadReader(private val listener: IGamepadListener?) {
         fileObserver?.let { runCatching { it.stopWatching() } }
         fileObserver = null
         thread?.interrupt()
+    }
+
+    /** 是否至少有一台设备被 EVIOCGRAB 独占。 */
+    fun isExclusiveActive(): Boolean = synchronized(sessionLock) {
+        sessions.values.any { it.grabbed }
+    }
+
+    /** 独占失败原因；无失败时为 null。 */
+    fun exclusiveError(): String? = exclusiveFailure
+
+    /** 当前是否处于游戏模式（设备已交还系统）。 */
+    fun isGameMode(): Boolean = !mouseMode
+
+    /**
+     * 鼠标模式 / 游戏模式切换。
+     *
+     * 游戏模式只做 `ioctl(fd, EVIOCGRAB, 0)` 释放抓取，**不关闭 fd**：
+     * 这样仍能读到 BTN_THUMBL，长按热键才能切回鼠标模式。
+     */
+    fun setMouseMode(enabled: Boolean) {
+        if (mouseMode == enabled) return
+        mouseMode = enabled
+        val snapshot = synchronized(sessionLock) { sessions.values.toList() }
+        for (session in snapshot) {
+            if (!enabled) {
+                session.ungrab()
+            } else if (exclusiveEnabled) {
+                val error = session.grab()
+                if (error != null) recordExclusiveFailure(session.info.name, error) else clearExclusiveFailure()
+            }
+        }
+        // 游戏模式是主动交还给系统，不算独占失败。
+        if (!enabled) exclusiveFailure = null
+        refreshRequested = true
     }
 
     /** 扫描 /dev/input 并返回手柄信息；不启动读取线程。 */
@@ -156,6 +206,11 @@ class GamepadReader(private val listener: IGamepadListener?) {
             removeSession(session)
             return
         }
+        // M10：打开后立即独占；失败时记录原因并退回旁听（不阻断读取）。
+        if (exclusiveEnabled && mouseMode) {
+            val error = session.grab()
+            if (error != null) recordExclusiveFailure(session.info.name, error) else clearExclusiveFailure()
+        }
         val thread = Thread({ readLoop(session) }, "gamepad-${session.path.substringAfterLast('/')}")
         session.thread = thread
         thread.isDaemon = true
@@ -209,6 +264,19 @@ class GamepadReader(private val listener: IGamepadListener?) {
             val normalized = normalize(value, range.min, range.max)
             runCatching { target.onAxis(code, normalized) }
         }
+    }
+
+    private fun recordExclusiveFailure(deviceName: String, reason: String) {
+        exclusiveFailure = (if (deviceName.isBlank()) "" else "$deviceName: ") + reason
+        Log.w("GamepadReader", "EVIOCGRAB 失败，回退旁听模式：$exclusiveFailure")
+    }
+
+    private fun clearExclusiveFailure() {
+        // 只有所有已打开设备都抓取成功才清除失败原因，避免多设备时互相覆盖。
+        val allGrabbed = synchronized(sessionLock) {
+            sessions.values.isNotEmpty() && sessions.values.all { it.grabbed }
+        }
+        if (allGrabbed) exclusiveFailure = null
     }
 
     private fun removeSession(session: DeviceSession) {
@@ -343,6 +411,18 @@ class GamepadReader(private val listener: IGamepadListener?) {
         if (openPaths.isNotEmpty()) {
             sb.append("\n\n读取中: ").append(openPaths.joinToString(", "))
         }
+        // M10：模式与独占状态（界面手柄区块直接展示）。
+        val grabbedCount = synchronized(sessionLock) { sessions.values.count { it.grabbed } }
+        sb.append("\n\n模式: ").append(if (mouseMode) "鼠标模式" else "游戏模式（已交还系统）")
+        sb.append(" · 独占: ").append(
+            when {
+                !exclusiveEnabled -> "已关闭（旁听）"
+                !mouseMode -> "已释放（游戏模式）"
+                grabbedCount > 0 -> "独占中（$grabbedCount 台）"
+                else -> "旁听中"
+            }
+        )
+        exclusiveFailure?.let { sb.append("\n独占失败: ").append(it) }
         if (error != null) sb.append("\n").append(error)
         return sb.toString()
     }
@@ -360,6 +440,13 @@ class GamepadReader(private val listener: IGamepadListener?) {
 
         private var pfd: ParcelFileDescriptor? = null
 
+        /** Os.open 返回的 FileDescriptor，供 ioctl 使用；关闭时置空避免误用。 */
+        private var osFd: FileDescriptor? = null
+
+        /** 当前是否已被 EVIOCGRAB 独占。 */
+        @Volatile var grabbed: Boolean = false
+            private set
+
         fun open() {
             // Os.open 返回 FileDescriptor；adoptFd 需要裸 fd，这里取出其内部 descriptor。
             val fileDescriptor = Os.open(info.path, OsConstants.O_RDONLY, 0)
@@ -369,14 +456,40 @@ class GamepadReader(private val listener: IGamepadListener?) {
                 runCatching { Os.close(fileDescriptor) }
                 throw t
             }
+            osFd = fileDescriptor
             val descriptor = ParcelFileDescriptor.adoptFd(rawFd)
             pfd = descriptor
             stream = FileInputStream(descriptor.fileDescriptor)
         }
 
+        /** 独占设备；返回 null 表示成功，否则为失败原因。 */
+        fun grab(): String? {
+            if (grabbed) return null
+            val fd = osFd ?: return "设备未打开"
+            return try {
+                evIoctlInt(fd, EVIOCGRAB, 1)
+                grabbed = true
+                null
+            } catch (t: Throwable) {
+                grabbed = false
+                detailOf(t, "EVIOCGRAB 失败")
+            }
+        }
+
+        /** 释放独占；与 [grab] 成对，关闭 fd 前必须先调用。 */
+        fun ungrab() {
+            if (!grabbed) return
+            grabbed = false
+            val fd = osFd ?: return
+            runCatching { evIoctlInt(fd, EVIOCGRAB, 0) }
+        }
+
         fun closeQuietly() {
             if (closed) return
             closed = true
+            // 先释放抓取再关 fd；异常路径下内核也会随 close 自动释放。
+            ungrab()
+            osFd = null
             val input = stream
             stream = null
             val descriptor = pfd
@@ -424,6 +537,9 @@ class GamepadReader(private val listener: IGamepadListener?) {
         private const val EV_KEY = 1
         private const val EV_ABS = 3
         private const val SCAN_INTERVAL_MS = 2_000L
+
+        /** _IOW('E', 0x90, int)：Linux 输入子系统 EVIOCGRAB。 */
+        const val EVIOCGRAB = 0x40044590
         private const val POLL_SLICE_MS = 200L
         private const val SCAN_TIMEOUT_MS = 4_000L
 
@@ -462,6 +578,40 @@ class GamepadReader(private val listener: IGamepadListener?) {
             "BTN_DPAD_RIGHT" to 0x223,
             "BTN_TRIGGER_HAPPY1" to 0x2c0,
         )
+
+        /**
+         * 调用 @hide 的 android.system.Os#ioctlInt(FileDescriptor, int, int)。
+         * 反射不可用时抛 [UnsupportedOperationException]，由 [DeviceSession.grab] 转成可见的失败原因。
+         */
+        private fun evIoctlInt(fd: FileDescriptor, request: Int, value: Int) {
+            val method = OsIoctl.method
+                ?: throw UnsupportedOperationException("android.system.Os#ioctlInt 不可用（反射失败）")
+            try {
+                method.invoke(null, fd, request, value)
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                throw e.targetException ?: e
+            }
+        }
+
+        /** 反射结果缓存；Android 上 ioctlInt 为 @hide，只能反射调用。 */
+        private object OsIoctl {
+            val method: java.lang.reflect.Method? = runCatching {
+                Class.forName("android.system.Os")
+                    .getMethod(
+                        "ioctlInt",
+                        FileDescriptor::class.java,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType
+                    )
+                    .apply { isAccessible = true }
+            }.getOrNull()
+        }
+
+        /** 异常 → 可展示的失败原因（带 errno 文案）。 */
+        private fun detailOf(t: Throwable, fallback: String): String {
+            val message = t.message?.takeIf { it.isNotBlank() }
+            return if (message != null) "${t.javaClass.simpleName}: $message" else "${t.javaClass.simpleName}: $fallback"
+        }
 
         /** 取出 FileDescriptor 的内部 fd；失败时由调用方关闭原描述符。 */
         private fun descriptorInt(fd: FileDescriptor): Int {
