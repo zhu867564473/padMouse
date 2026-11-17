@@ -1,5 +1,5 @@
 /*
- * PadMouse 原生 ioctl 桥（CMake 构建，输出 libpadmouse_evioctl.so）。
+ * PadMouse 原生 ioctl 桥（CMake 构建，输出 libnative_ioctl.so）。
  *
  * Android 16（API 36）移除了 android.system.Os / libcore.io.* 的三参
  * ioctlInt(FileDescriptor, int, int)，只剩两参版本（arg 固定 0），

@@ -51,6 +51,11 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        // extractNativeLibs=true：让 .so 解压到 nativeLibraryDir，
+        // 否则 Shizuku UserService（app_process）无法 System.load 到 APK 内的 .so
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     lint {

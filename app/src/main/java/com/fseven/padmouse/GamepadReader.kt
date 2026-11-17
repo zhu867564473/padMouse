@@ -25,8 +25,8 @@ class GamepadReader(
     exclusive: Boolean = true,
     /** 鼠标模式 = 独占 + 映射；游戏模式 = 释放抓取但 fd 保持打开（热键仍可读）。 */
     mouseMode: Boolean = true,
-    /** App 的 nativeLibraryDir，供 UserService 显式 System.load 原生库。 */
-    private val nativeLibDir: String? = null,
+    /** App 提供的 nativeLibraryDir / codeCacheDir / APK 路径，供 UserService 显式 System.load 原生库。 */
+    private val libPaths: NativeLibPaths? = null,
 ) {
 
     private val scanLock = Any()
@@ -185,7 +185,7 @@ class GamepadReader(
             }
             for (device in gamepads) {
                 if (!sessions.containsKey(device.path)) {
-                    val session = DeviceSession(device, nativeLibDir)
+                    val session = DeviceSession(device, libPaths)
                     sessions[device.path] = session
                     toStart.add(session)
                 }
@@ -435,7 +435,7 @@ class GamepadReader(
 
     // ---------------- 会话与描述结构 ----------------
 
-    private class DeviceSession(initial: DeviceDescriptor, private val nativeLibDir: String?) {
+    private class DeviceSession(initial: DeviceDescriptor, private val libPaths: NativeLibPaths?) {
         @Volatile var info: DeviceDescriptor = initial
         val path: String = initial.path
         var stream: FileInputStream? = null
@@ -473,7 +473,7 @@ class GamepadReader(
             if (grabbed) return null
             val fd = osFd ?: return "设备未打开"
             return try {
-                val result = evIoctlInt(fd, EVIOCGRAB, 1, nativeLibDir)
+                val result = evIoctlInt(fd, EVIOCGRAB, 1, libPaths)
                 if (result == 0) {
                     grabbed = true
                     null
@@ -497,7 +497,7 @@ class GamepadReader(
             if (!grabbed) return true
             val fd = osFd ?: return false
             return try {
-                val result = evIoctlInt(fd, EVIOCGRAB, 0, nativeLibDir)
+                val result = evIoctlInt(fd, EVIOCGRAB, 0, libPaths)
                 if (result == 0) {
                     grabbed = false
                     true
@@ -633,9 +633,9 @@ class GamepadReader(
             fd: FileDescriptor,
             request: Int,
             value: Int,
-            nativeLibDir: String?,
+            libPaths: NativeLibPaths?,
         ): Int {
-            if (!NativeIoctl.ensureLoaded(nativeLibDir)) {
+            if (!NativeIoctl.ensureLoaded(libPaths)) {
                 throw UnsupportedOperationException(
                     "原生 ioctl 库不可用：" + (NativeIoctl.loadError ?: "未知原因")
                 )
