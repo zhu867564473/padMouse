@@ -98,16 +98,20 @@ class GamepadReader(
         if (mouseMode == enabled) return
         mouseMode = enabled
         val snapshot = synchronized(sessionLock) { sessions.values.toList() }
+        var releaseFailed = false
         for (session in snapshot) {
             if (!enabled) {
-                session.ungrab()
+                if (!session.ungrab()) {
+                    releaseFailed = true
+                    recordExclusiveFailure(session.info.name, "EVIOCGRAB(0) 失败，设备仍被占用")
+                }
             } else if (exclusiveEnabled) {
                 val error = session.grab()
                 if (error != null) recordExclusiveFailure(session.info.name, error) else clearExclusiveFailure()
             }
         }
-        // 游戏模式是主动交还给系统，不算独占失败。
-        if (!enabled) exclusiveFailure = null
+        // 主动交还系统且确认释放成功时才清除失败原因，避免「显示已释放、实际仍占用」。
+        if (!enabled && !releaseFailed) exclusiveFailure = null
         refreshRequested = true
     }
 
@@ -268,7 +272,7 @@ class GamepadReader(
 
     private fun recordExclusiveFailure(deviceName: String, reason: String) {
         exclusiveFailure = (if (deviceName.isBlank()) "" else "$deviceName: ") + reason
-        Log.w("GamepadReader", "EVIOCGRAB 失败，回退旁听模式：$exclusiveFailure")
+        Log.w(TAG, "EVIOCGRAB 失败，回退旁听模式：$exclusiveFailure")
     }
 
     private fun clearExclusiveFailure() {
@@ -462,33 +466,56 @@ class GamepadReader(
             stream = FileInputStream(descriptor.fileDescriptor)
         }
 
-        /** 独占设备；返回 null 表示成功，否则为失败原因。 */
+        /** 独占设备；返回 null 表示成功，否则为失败原因（含 ioctl 非 0 返回）。 */
         fun grab(): String? {
             if (grabbed) return null
             val fd = osFd ?: return "设备未打开"
             return try {
-                evIoctlInt(fd, EVIOCGRAB, 1)
-                grabbed = true
-                null
+                val result = evIoctlInt(fd, EVIOCGRAB, 1)
+                if (result == 0) {
+                    grabbed = true
+                    null
+                } else {
+                    grabbed = false
+                    "EVIOCGRAB 返回 $result"
+                }
             } catch (t: Throwable) {
                 grabbed = false
                 detailOf(t, "EVIOCGRAB 失败")
             }
         }
 
-        /** 释放独占；与 [grab] 成对，关闭 fd 前必须先调用。 */
-        fun ungrab() {
-            if (!grabbed) return
-            grabbed = false
-            val fd = osFd ?: return
-            runCatching { evIoctlInt(fd, EVIOCGRAB, 0) }
+        /**
+         * 释放独占；返回 true 表示 ioctl 确认成功。
+         *
+         * 失败时不改 grabbed（内核仍持有抓取），由 [closeQuietly] 关闭 fd 兜底，
+         * 并把原因交给调用方展示，避免「界面显示已释放、实际仍被占用」。
+         */
+        fun ungrab(): Boolean {
+            if (!grabbed) return true
+            val fd = osFd ?: return false
+            return try {
+                val result = evIoctlInt(fd, EVIOCGRAB, 0)
+                if (result == 0) {
+                    grabbed = false
+                    true
+                } else {
+                    Log.w(TAG, "EVIOCGRAB(0) 返回 $result，保留抓取状态直至 fd 关闭")
+                    false
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "EVIOCGRAB(0) 失败：${detailOf(t, "EVIOCGRAB 释放失败")}")
+                false
+            }
         }
 
         fun closeQuietly() {
             if (closed) return
             closed = true
-            // 先释放抓取再关 fd；异常路径下内核也会随 close 自动释放。
-            ungrab()
+            // 先释放抓取再关 fd；释放失败时内核仍会随 close 强制释放。
+            if (!ungrab() && grabbed) {
+                Log.w(TAG, "关闭 fd 前未能 ungrab，依赖内核随 close 释放")
+            }
             osFd = null
             val input = stream
             stream = null
@@ -508,6 +535,8 @@ class GamepadReader(
             if (input != null) {
                 if (detached || descriptor == null) runCatching { input.close() }
             }
+            // fd 已关闭：内核保证释放 EVIOCGRAB。
+            grabbed = false
         }
     }
 
@@ -537,6 +566,8 @@ class GamepadReader(
         private const val EV_KEY = 1
         private const val EV_ABS = 3
         private const val SCAN_INTERVAL_MS = 2_000L
+
+        private const val TAG = "GamepadReader"
 
         /** _IOW('E', 0x90, int)：Linux 输入子系统 EVIOCGRAB。 */
         const val EVIOCGRAB = 0x40044590
@@ -580,31 +611,140 @@ class GamepadReader(
         )
 
         /**
-         * 调用 @hide 的 android.system.Os#ioctlInt(FileDescriptor, int, int)。
-         * 反射不可用时抛 [UnsupportedOperationException]，由 [DeviceSession.grab] 转成可见的失败原因。
+         * 调用 ioctl(fd, request, value)，返回目标方法的结果（0 = 成功）。
+         *
+         * android.system.Os#ioctlInt 是 @hide，且不同 Android 版本/机型签名不同：
+         * - 3 参 int（多数版本，含 R~15）
+         * - 3 参 android.util.MutableInt（部分旧版本）
+         * - Android 16（API 36）真机只暴露 2 参版本，arg 固定为 0
+         * 这里在运行时枚举可用签名并逐个尝试，全部不可用时抛出「已发现签名」清单，
+         * 由 [DeviceSession.grab] 转成界面上可见的失败原因。
          */
-        private fun evIoctlInt(fd: FileDescriptor, request: Int, value: Int) {
-            val method = OsIoctl.method
-                ?: throw UnsupportedOperationException("android.system.Os#ioctlInt 不可用（反射失败）")
-            try {
-                method.invoke(null, fd, request, value)
-            } catch (e: java.lang.reflect.InvocationTargetException) {
-                throw e.targetException ?: e
+        private fun evIoctlInt(fd: FileDescriptor, request: Int, value: Int): Int {
+            var lastError: Throwable? = null
+            for (candidate in IoctlBridge.candidates) {
+                if (candidate.argMode == ArgMode.NONE && value != 0) continue
+                try {
+                    return candidate.invoke(fd, request, value)
+                } catch (e: java.lang.reflect.InvocationTargetException) {
+                    // 已进入目标方法：errno 等设备级错误直接上抛，不再换签名重试。
+                    throw e.targetException ?: e
+                } catch (t: Throwable) {
+                    lastError = t
+                }
+            }
+            val found = IoctlBridge.signatures
+            val detail = if (found.isEmpty()) "未发现 ioctlInt" else found.joinToString("; ")
+            throw UnsupportedOperationException(
+                "无可用 ioctlInt(FileDescriptor,int,arg) 签名（已发现: $detail）" +
+                    (lastError?.let { "；最后错误: ${it.javaClass.simpleName}: ${it.message}" } ?: "")
+            )
+        }
+
+        /** ioctl 参数传递方式（不同 Android 版本签名不同）。 */
+        private enum class ArgMode { INT, LONG, MUTABLE_INT, NONE }
+
+        private class IoctlCandidate(
+            private val target: Any?,
+            private val method: java.lang.reflect.Method,
+            val argMode: ArgMode,
+        ) {
+            fun invoke(fd: FileDescriptor, request: Int, value: Int): Int {
+                method.isAccessible = true
+                val result = when (argMode) {
+                    ArgMode.INT -> method.invoke(target, fd, request, value)
+                    ArgMode.LONG -> method.invoke(target, fd, request, value.toLong())
+                    ArgMode.MUTABLE_INT -> {
+                        val arg = IoctlBridge.mutableInt(value)
+                            ?: throw UnsupportedOperationException("android.util.MutableInt 不可用")
+                        method.invoke(target, fd, request, arg)
+                    }
+                    ArgMode.NONE -> method.invoke(target, fd, request)
+                }
+                return (result as? Int) ?: 0
             }
         }
 
-        /** 反射结果缓存；Android 上 ioctlInt 为 @hide，只能反射调用。 */
-        private object OsIoctl {
-            val method: java.lang.reflect.Method? = runCatching {
-                Class.forName("android.system.Os")
-                    .getMethod(
-                        "ioctlInt",
-                        FileDescriptor::class.java,
-                        Int::class.javaPrimitiveType,
-                        Int::class.javaPrimitiveType
-                    )
-                    .apply { isAccessible = true }
-            }.getOrNull()
+        /**
+         * 运行时枚举 ioctlInt 候选：
+         * android.system.Os（静态）→ libcore.io.Libcore.os（实例）→ libcore.io.Linux（实例）。
+         * 优先 3 参 int > 3 参 MutableInt > 2 参（仅 arg=0 时可用）。
+         */
+        private object IoctlBridge {
+
+            private val owners: List<Pair<Class<*>, Any?>> by lazy {
+                val result = ArrayList<Pair<Class<*>, Any?>>()
+                runCatching { Class.forName("android.system.Os") }.getOrNull()?.let {
+                    result += it to null
+                }
+                runCatching {
+                    val libcore = Class.forName("libcore.io.Libcore")
+                    val field = libcore.getDeclaredField("os").apply { isAccessible = true }
+                    field.get(null)
+                }.getOrNull()?.let { result += it.javaClass to it }
+                runCatching {
+                    Class.forName("libcore.io.Linux").getDeclaredConstructor().newInstance()
+                }.getOrNull()?.let { result += it.javaClass to it }
+                result
+            }
+
+            val candidates: List<IoctlCandidate> by lazy {
+                val list = ArrayList<IoctlCandidate>()
+                for ((owner, target) in owners) {
+                    val methods = runCatching {
+                        (owner.declaredMethods.asList() + owner.methods.asList())
+                            .filter { it.name == "ioctlInt" }
+                    }.getOrDefault(emptyList())
+                        .distinctBy { it.parameterTypes.joinToString(",") + "|" + it.parameterCount }
+                    for (method in methods) {
+                        val mode = argModeOf(method.parameterTypes) ?: continue
+                        list += IoctlCandidate(target, method, mode)
+                    }
+                }
+                list.sortedBy { it.argMode.ordinal }
+            }
+
+            /** 诊断用：当前进程实际可见的 ioctlInt 签名。 */
+            val signatures: List<String> by lazy {
+                runCatching {
+                    owners.flatMap { (owner, _) ->
+                        owner.declaredMethods.filter { it.name == "ioctlInt" }.map { method ->
+                            owner.simpleName + "#ioctlInt(" +
+                                method.parameterTypes.joinToString(",") { it.simpleName } + ")"
+                        }
+                    }.distinct()
+                }.getOrDefault(emptyList())
+            }
+
+            private val mutableIntCtor: java.lang.reflect.Constructor<*>? by lazy {
+                runCatching {
+                    Class.forName("android.util.MutableInt")
+                        .getDeclaredConstructor(Int::class.javaPrimitiveType)
+                        .apply { isAccessible = true }
+                }.getOrNull()
+            }
+
+            fun mutableInt(value: Int): Any? =
+                runCatching { mutableIntCtor?.newInstance(value) }.getOrNull()
+
+            private fun argModeOf(types: Array<Class<*>>): ArgMode? = when {
+                types.size == 3 && types[0] == FileDescriptor::class.java &&
+                    types[1] == Int::class.javaPrimitiveType &&
+                    types[2] == Int::class.javaPrimitiveType -> ArgMode.INT
+
+                types.size == 3 && types[0] == FileDescriptor::class.java &&
+                    types[1] == Int::class.javaPrimitiveType &&
+                    types[2] == java.lang.Long.TYPE -> ArgMode.LONG
+
+                types.size == 3 && types[0] == FileDescriptor::class.java &&
+                    types[1] == Int::class.javaPrimitiveType &&
+                    types[2].name == "android.util.MutableInt" -> ArgMode.MUTABLE_INT
+
+                types.size == 2 && types[0] == FileDescriptor::class.java &&
+                    types[1] == Int::class.javaPrimitiveType -> ArgMode.NONE
+
+                else -> null
+            }
         }
 
         /** 异常 → 可展示的失败原因（带 errno 文案）。 */

@@ -99,7 +99,7 @@
     <string name="gamepad_mode_exclusive">模式：鼠标模式 · 独占中（前台 App 不会收到手柄事件）</string>
     <string name="gamepad_mode_listen">模式：鼠标模式 · 旁听中（未独占）</string>
     <string name="gamepad_mode_game">模式：游戏模式（已交还系统，光标隐藏、不注入）</string>
-    <string name="gamepad_mode_exclusive_failed">模式：鼠标模式 · 独占失败：%1$s</string>
+    <string name="gamepad_mode_exclusive_failed">模式：鼠标模式 · 独占不可用：%1$s</string>
 
     <!-- 映射实时状态 -->
     <string name="mapping_card_title">实时状态（调试）</string>

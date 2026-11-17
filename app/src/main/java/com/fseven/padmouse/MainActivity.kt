@@ -96,7 +96,7 @@ class MainActivity : AppCompatActivity() {
     // M10 独占：开关 + 模式切换热键
     private lateinit var exclusiveSwitch: SwitchMaterial
     private lateinit var modeToggleSpinner: Spinner
-    private var modeToggleBinding: ActionBinding = DefaultBindings.MODE_TOGGLE_BINDING
+    private var modeToggleBinding: ActionBinding = SettingsRepository.DEFAULT_MODE_TOGGLE_BINDING
 
     // 四、设置：光标外观
     private lateinit var cursorSizeSeek: SeekBar
@@ -116,7 +116,7 @@ class MainActivity : AppCompatActivity() {
     // 四、设置：按键绑定
     private lateinit var systemBindingsResetButton: Button
     private val systemSpinners = LinkedHashMap<SystemAction, Spinner>()
-    private var systemBindings: Map<SystemAction, ActionBinding> = DefaultBindings.SYSTEM_ACTIONS
+    private var systemBindings: Map<SystemAction, ActionBinding> = SettingsRepository.SYSTEM_ACTION_DEFAULTS
 
     private var lastUserServiceState: UserServiceState? = null
     private var disconnectNotified = false
@@ -1178,7 +1178,7 @@ class MainActivity : AppCompatActivity() {
         }
         systemBindingsResetButton.setOnClickListener {
             settingsRepository.resetSystemBindings()
-            systemBindings = DefaultBindings.SYSTEM_ACTIONS
+            systemBindings = SettingsRepository.SYSTEM_ACTION_DEFAULTS
             applySystemBindings()
             for ((action, spinner) in systemSpinners) bindSystemActionSpinner(action, spinner)
             Toast.makeText(this, R.string.system_action_reset_toast, Toast.LENGTH_SHORT).show()
@@ -1191,7 +1191,7 @@ class MainActivity : AppCompatActivity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinner.adapter = adapter
-        val current = systemBindings[action] ?: DefaultBindings.SYSTEM_ACTIONS.getValue(action)
+        val current = systemBindings[action] ?: SettingsRepository.SYSTEM_ACTION_DEFAULTS.getValue(action)
         spinner.setSelection(options.indexOfFirst { it.binding == current }.coerceAtLeast(0), false)
         spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {

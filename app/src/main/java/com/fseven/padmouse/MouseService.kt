@@ -93,7 +93,7 @@ class MouseService : Service() {
     private var overlayHidden = false
 
     /** 模式切换热键绑定（缓存，避免每个按键事件都读 SharedPreferences）。 */
-    private var modeToggleBinding: ActionBinding = DefaultBindings.MODE_TOGGLE_BINDING
+    private var modeToggleBinding: ActionBinding = SettingsRepository.DEFAULT_MODE_TOGGLE_BINDING
 
     /** 长按判定：按下后延时触发，松开取消（短按不动作）。 */
     private val modeToggleRunnable = Runnable { toggleMouseMode() }
@@ -706,7 +706,7 @@ class MouseService : Service() {
     // ---------------------------------------------------------------- M10 独占 / 模式切换
 
     /**
-     * 模式切换热键：命中绑定且按下时开始 [DefaultBindings.MODE_TOGGLE_LONG_PRESS_MS] 计时，
+     * 模式切换热键：命中绑定且按下时开始 [SettingsRepository.MODE_TOGGLE_LONG_PRESS_MS] 计时，
      * 松开取消（短按不动作）。返回 true 表示事件已被消费，不再交给映射引擎。
      */
     private fun handleModeToggleKey(code: Int, value: Int): Boolean {
@@ -715,7 +715,7 @@ class MouseService : Service() {
         when (value) {
             1 -> {
                 handler.removeCallbacks(modeToggleRunnable)
-                handler.postDelayed(modeToggleRunnable, DefaultBindings.MODE_TOGGLE_LONG_PRESS_MS)
+                handler.postDelayed(modeToggleRunnable, SettingsRepository.MODE_TOGGLE_LONG_PRESS_MS)
             }
 
             0 -> handler.removeCallbacks(modeToggleRunnable)

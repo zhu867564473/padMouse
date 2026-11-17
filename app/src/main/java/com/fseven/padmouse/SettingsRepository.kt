@@ -61,7 +61,7 @@ class SettingsRepository(context: Context) {
     fun loadModeToggleBinding(): ActionBinding =
         ActionBinding.decode(prefs.getString(KEY_MODE_TOGGLE, null))
             ?.takeIf { it.direction == 0 && !it.isChord }
-            ?: DefaultBindings.MODE_TOGGLE_BINDING
+            ?: DEFAULT_MODE_TOGGLE_BINDING
 
     fun saveModeToggleBinding(binding: ActionBinding) {
         if (binding.direction != 0 || binding.isChord) return
@@ -116,7 +116,7 @@ class SettingsRepository(context: Context) {
     fun loadSystemBindings(): Map<SystemAction, ActionBinding> {
         val result = LinkedHashMap<SystemAction, ActionBinding>()
         for (action in SystemAction.values()) {
-            val fallback = DefaultBindings.SYSTEM_ACTIONS[action] ?: continue
+            val fallback = SYSTEM_ACTION_DEFAULTS[action] ?: continue
             result[action] = ActionBinding.decode(prefs.getString(keyOf(action), null)) ?: fallback
         }
         return result
@@ -126,7 +126,7 @@ class SettingsRepository(context: Context) {
         prefs.edit().putString(keyOf(action), binding.encode()).apply()
     }
 
-    /** 清除全部自定义绑定，恢复 [DefaultBindings.SYSTEM_ACTIONS]。 */
+    /** 清除全部自定义绑定，恢复 [SYSTEM_ACTION_DEFAULTS]。 */
     fun resetSystemBindings() {
         val editor = prefs.edit()
         for (action in SystemAction.values()) editor.remove(keyOf(action))
@@ -150,7 +150,7 @@ class SettingsRepository(context: Context) {
         for ((action, old) in legacy) {
             val stored = ActionBinding.decode(prefs.getString(keyOf(action), null))
             if (stored == old) {
-                DefaultBindings.SYSTEM_ACTIONS[action]?.let {
+                SYSTEM_ACTION_DEFAULTS[action]?.let {
                     editor.putString(keyOf(action), it.encode())
                 }
             }
@@ -202,6 +202,31 @@ class SettingsRepository(context: Context) {
         private const val KEY_EXCLUSIVE_MODE = "gamepad_exclusive_mode"
         private const val KEY_MODE_TOGGLE = "gamepad_mode_toggle_binding"
         private const val KEY_MODE_TOGGLE_MIGRATED = "gamepad_mode_toggle_migrated_v1"
+
+        // ---------------------------------------------------------------- M10 默认绑定
+
+        /** 模式切换热键长按阈值；短按不动作。 */
+        const val MODE_TOGGLE_LONG_PRESS_MS = 800L
+
+        /** 模式切换热键默认 L3；不允许清空。 */
+        val DEFAULT_MODE_TOGGLE_BINDING: ActionBinding = ActionBinding(DefaultBindings.BTN_THUMBL)
+
+        /**
+         * 系统动作默认绑定（M10 调整版）：
+         * - 十字键左/右（ABS_HAT0X -1/+1）→ 音量减/加（L3 让位给模式切换热键）
+         * - 十字键上/下（ABS_HAT0Y -1/+1）→ 亮度加/减
+         * 其余动作沿用 M6 默认值。
+         */
+        val SYSTEM_ACTION_DEFAULTS: Map<SystemAction, ActionBinding> = linkedMapOf(
+            SystemAction.BACK to ActionBinding(DefaultBindings.BTN_SELECT),
+            SystemAction.HOME to ActionBinding(DefaultBindings.BTN_START),
+            SystemAction.RECENTS to ActionBinding(DefaultBindings.BTN_MODE),
+            SystemAction.VOLUME_DOWN to ActionBinding(DefaultBindings.AXIS_HAT0X, direction = -1),
+            SystemAction.VOLUME_UP to ActionBinding(DefaultBindings.AXIS_HAT0X, direction = 1),
+            SystemAction.BRIGHTNESS_UP to ActionBinding(DefaultBindings.AXIS_HAT0Y, direction = -1),
+            SystemAction.BRIGHTNESS_DOWN to ActionBinding(DefaultBindings.AXIS_HAT0Y, direction = 1),
+            SystemAction.SCREENSHOT to ActionBinding(DefaultBindings.BTN_TL, chordCode = DefaultBindings.BTN_TR),
+        )
 
         const val MIN_IDLE_SECONDS = 1
         const val MAX_IDLE_SECONDS = 10
