@@ -763,6 +763,16 @@ class MouseService : Service() {
                 setOverlayVisible(false)
                 MouseService.setUhidState(true, actual)
                 Log.i(TAG, "UHID 虚拟鼠标就绪: $actual")
+                // 设备刚就绪时发一次 1px 的往返移动。
+                // 系统（尤其 HyperOS 的 PointerChoreographer）要收到一次真实的指针事件
+                // 才会为这个设备建立光标状态；否则首次切到微信/微信读书时光标不出现，
+                // 用户必须下拉通知栏"唤"一次才行。
+                handler.postDelayed({
+                    runCatching {
+                        mapperInjector.uhidMove(1, 0)
+                        mapperInjector.uhidMove(-1, 0)
+                    }.onFailure { Log.w(TAG, "UHID 预热移动失败", it) }
+                }, 200)
             } else {
                 val reason = when {
                     actual.isNotEmpty() -> actual
@@ -1086,16 +1096,18 @@ class MouseService : Service() {
     private fun syncOverlayForForeground() {
         // 只要不是 UHID 后端，自绘光标本来就是主光标，不需要切换。
         if (inputMode != InputMode.UHID) return
-        val show = !MouseRuntime.appForeground
-        if (show == overlayForOtherApp) return
-        overlayForOtherApp = show
-        Log.d(
-            TAG,
-            "syncOverlay show=$show appForeground=${MouseRuntime.appForeground} " +
-                "cursorView=${cursorView != null} params=${layoutParams != null} added=$overlayAdded"
-        )
-        setOverlayVisible(show, autoHide = false)
-        Log.d(TAG, "syncOverlay done added=$overlayAdded attached=${cursorView?.isAttachedToWindow}")
+        val inOtherApp = !MouseRuntime.appForeground
+        if (inOtherApp == overlayForOtherApp) return
+        overlayForOtherApp = inOtherApp
+        if (!inOtherApp) return
+        // 刚切到别的 App 时，HyperOS 的 PointerChoreographer 会丢掉光标状态
+        // （日志：Invalid device id -1），表现为光标消失、必须下拉状态栏才回来。
+        // 这里发一次 1px 往返移动，效果等同于用户下拉状态栏的那次唤醒，
+        // 但不会画自绘光标，用户只会看到光标"闪一下就出现"。
+        runCatching {
+            mapperInjector.uhidMove(1, 0)
+            mapperInjector.uhidMove(-1, 0)
+        }.onFailure { Log.w(TAG, "切换 App 预热移动失败", it) }
     }
 
     private fun setOverlayVisible(visible: Boolean, autoHide: Boolean = true) {

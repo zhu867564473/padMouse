@@ -132,8 +132,40 @@ class SettingsRepository(context: Context) {
         deadzone = loadDeadzone(),
         speedPxPerSec = loadSpeedPxPerSec(),
         exponent = loadAccelExponent(),
+        buttonBindings = loadButtonBindings(),
         systemBindings = systemBindings,
     )
+
+    // ---------------------------------------------------------------- 鼠标动作绑定
+
+    /**
+     * A/B/X/LB/RB → 鼠标动作。
+     *
+     * 未自定义过的键回落到 [DefaultBindings.BUTTON_ACTIONS]，改了单个键不影响其它键。
+     */
+    fun loadButtonBindings(): Map<Int, MouseAction> {
+        val result = LinkedHashMap<Int, MouseAction>()
+        for ((code, fallback) in DefaultBindings.BUTTON_ACTIONS) {
+            val saved = prefs.getString(keyOfButton(code), null)
+            result[code] = saved?.let { name ->
+                runCatching { MouseAction.valueOf(name) }.getOrNull()
+            } ?: fallback
+        }
+        return result
+    }
+
+    fun saveButtonBinding(code: Int, action: MouseAction) {
+        prefs.edit().putString(keyOfButton(code), action.name).apply()
+    }
+
+    /** 恢复鼠标动作的默认绑定。 */
+    fun resetButtonBindings() {
+        val editor = prefs.edit()
+        for (code in DefaultBindings.BUTTON_ACTIONS.keys) editor.remove(keyOfButton(code))
+        editor.apply()
+    }
+
+    private fun keyOfButton(code: Int): String = "button_action_$code"
 
     // ---------------------------------------------------------------- 按键绑定
 

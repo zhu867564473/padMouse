@@ -135,6 +135,9 @@ class MainActivity : AppCompatActivity() {
     // 四、设置：按键绑定
     private lateinit var systemBindingsResetButton: Button
     private val systemSpinners = LinkedHashMap<SystemAction, Spinner>()
+
+    /** 鼠标动作绑定下拉框：手柄键码 → Spinner。 */
+    private val mouseSpinners = LinkedHashMap<Int, Spinner>()
     private var systemBindings: Map<SystemAction, ActionBinding> = SettingsRepository.SYSTEM_ACTION_DEFAULTS
 
     private var lastUserServiceState: UserServiceState? = null
@@ -276,6 +279,8 @@ class MainActivity : AppCompatActivity() {
         runToggleButton.setOnClickListener { setCursorEnabled(!MouseService.isRunning) }
 
         setupSystemBindings()
+        setupMouseBindings()
+        setupAutostartButton()
         setupModeToggleBinding()
         setupExclusiveControls()
         setupInputModeControls()
@@ -1551,6 +1556,112 @@ class MainActivity : AppCompatActivity() {
         pushMapperConfig()
     }
 
+    // ---------------------------------------------------------------- 自启动（MIUI 私有）
+
+    /**
+     * 自启动是 MIUI 私有开关，没有公开 API 也无法用 Shizuku 授予
+     * （实测 `pm grant miui.permission.AUTO_START` 抛异常、`appops AUTO_START` 未知操作），
+     * 所以这里只做跳转引导：直接打开 MIUI 的自启动管理页，省去用户翻设置。
+     */
+    private fun setupAutostartButton() {
+        findViewById<Button>(R.id.button_open_autostart).setOnClickListener {
+            if (openAutostartSettings()) {
+                Toast.makeText(this, R.string.autostart_granted_toast, Toast.LENGTH_LONG).show()
+            } else {
+                // 非 MIUI 或页面不存在时退回应用详情页。
+                runCatching {
+                    startActivity(
+                        Intent(
+                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:$packageName")
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /** MIUI 自启动管理页；不存在时返回 false。 */
+    private fun openAutostartSettings(): Boolean = runCatching {
+        startActivity(
+            Intent().setComponent(
+                android.content.ComponentName(
+                    "com.miui.securitycenter",
+                    "com.miui.permcenter.autostart.AutoStartManagementActivity"
+                )
+            )
+        )
+        true
+    }.getOrDefault(false)
+
+    // ---------------------------------------------------------------- 鼠标按键绑定
+
+    /** A/B/X/LB/RB 各一个下拉框；选中即保存并热更新 Mapper。 */
+    private fun setupMouseBindings() {
+        mouseSpinners[DefaultBindings.BTN_A] = findViewById(R.id.spinner_mouse_a)
+        mouseSpinners[DefaultBindings.BTN_B] = findViewById(R.id.spinner_mouse_b)
+        mouseSpinners[DefaultBindings.BTN_X] = findViewById(R.id.spinner_mouse_x)
+        mouseSpinners[DefaultBindings.BTN_TL] = findViewById(R.id.spinner_mouse_lb)
+        mouseSpinners[DefaultBindings.BTN_TR] = findViewById(R.id.spinner_mouse_rb)
+
+        for ((code, spinner) in mouseSpinners) bindMouseActionSpinner(code, spinner)
+
+        findViewById<Button>(R.id.button_reset_mouse_bindings).setOnClickListener {
+            settingsRepository.resetButtonBindings()
+            for ((code, spinner) in mouseSpinners) bindMouseActionSpinner(code, spinner)
+            pushMapperConfig()
+            Toast.makeText(this, R.string.mouse_action_reset_toast, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun bindMouseActionSpinner(code: Int, spinner: Spinner) {
+        val current = settingsRepository.loadButtonBindings()[code] ?: return
+        val actions = MOUSE_ACTION_OPTIONS
+        val labels = actions.map { getString(mouseActionLabelRes(it)) }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+        spinner.setSelection(actions.indexOf(current).coerceAtLeast(0), false)
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val action = actions.getOrNull(position) ?: return
+                if (action == current) return
+                settingsRepository.saveButtonBinding(code, action)
+                pushMapperConfig()
+                Toast.makeText(
+                    this@MainActivity,
+                    getString(
+                        R.string.mouse_action_saved,
+                        getString(mouseKeyLabelRes(code)),
+                        getString(mouseActionLabelRes(action))
+                    ),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+    }
+
+    private fun mouseActionLabelRes(action: MouseAction): Int = when (action) {
+        MouseAction.TAP -> R.string.mouse_action_tap
+        MouseAction.RIGHT_CLICK -> R.string.mouse_action_right_click
+        MouseAction.MIDDLE_CLICK -> R.string.mouse_action_middle_click
+        MouseAction.SCROLL_UP -> R.string.mouse_action_scroll_up
+        MouseAction.SCROLL_DOWN -> R.string.mouse_action_scroll_down
+        MouseAction.LEFT_HOLD -> R.string.mouse_action_left_hold
+        MouseAction.RIGHT_HOLD -> R.string.mouse_action_right_hold
+    }
+
+    private fun mouseKeyLabelRes(code: Int): Int = when (code) {
+        DefaultBindings.BTN_A -> R.string.mouse_key_a
+        DefaultBindings.BTN_B -> R.string.mouse_key_b
+        DefaultBindings.BTN_X -> R.string.mouse_key_x
+        DefaultBindings.BTN_TL -> R.string.mouse_key_lb
+        DefaultBindings.BTN_TR -> R.string.mouse_key_rb
+        else -> R.string.mouse_action_section
+    }
+
     // ---------------------------------------------------------------- M10 独占 / 模式热键
 
     /** 独占手柄开关：持久化后通知服务按新配置重建读取器（立即生效）。 */
@@ -1723,6 +1834,17 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
+
+        /** 鼠标按键可在设置页选的动作，顺序即下拉框顺序。 */
+        private val MOUSE_ACTION_OPTIONS = listOf(
+            MouseAction.TAP,
+            MouseAction.RIGHT_CLICK,
+            MouseAction.MIDDLE_CLICK,
+            MouseAction.SCROLL_UP,
+            MouseAction.SCROLL_DOWN,
+            MouseAction.LEFT_HOLD,
+            MouseAction.RIGHT_HOLD,
+        )
         private const val MAPPING_RENDER_INTERVAL_MS = 50L
         private const val DISABLED_ALPHA = 0.4f
         private const val MAPPING_POLL_MS = 100L

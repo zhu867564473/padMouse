@@ -255,11 +255,9 @@ class UhidMouse {
         buffer.put(fixedString(PHYS, 64))
         buffer.put(ByteArray(64)) // uniq：留空
         buffer.putShort(descriptor.size.toShort())
-        // 用 BUS_VIRTUAL 而不是 BUS_USB：
-        // EventHub 判定 bus==USB/BLUETOOTH 即 isExternal=true，而外部设备的
-        // CursorInputMapper 在拿不到 AssociatedDisplay 时 DisplayId 会停在 -1，
-        // 系统就不画系统光标（实测微信/微信读书里指针完全消失）。
-        // 声明为虚拟设备 → isExternal=false → DisplayId 回落主屏 0 → 光标正常。
+        // BUS_VIRTUAL 与 scrcpy 的 UHID 鼠标完全一致：
+        // dumpsys diff 显示 scrcpy 是 IsExternal=false，而 USB/蓝牙总线会变成 true，
+        // 外部设备在拿不到 AssociatedDisplay 时 DisplayId 停在 -1，系统不画光标。
         buffer.putShort(BUS_VIRTUAL.toShort())
         buffer.putInt(VENDOR_ID)
         buffer.putInt(PRODUCT_ID)
@@ -300,7 +298,7 @@ class UhidMouse {
         private const val TAG = "UhidMouse"
 
         private const val UHID_PATH = "/dev/uhid"
-        private const val DEVICE_NAME = "PadMouse Virtual Mouse"
+        private const val DEVICE_NAME = "scrcpy"
         // phys 留空，与 scrcpy 完全一致。
         // 填 "padmouse/uhid" 会让 InputReader 记录成自定义 Location，
         // 实测会导致部分 App（微信/微信读书）不绘制系统光标。
@@ -312,6 +310,7 @@ class UhidMouse {
         private const val UHID_INPUT2 = 12
 
         private const val BUS_USB = 0x03
+        private const val BUS_BT = 0x05
         private const val BUS_VIRTUAL = 0x06
         // 与 scrcpy 的 UHID 鼠标完全对齐：vendor/product 都用 0。
         // 实测 0x1209(pid.codes 测试用 ID) 会被部分 App 当作未知设备，
