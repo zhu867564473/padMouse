@@ -877,7 +877,10 @@ class MouseService : Service() {
             Log.w(TAG_VIBRATE, "没有可用的震动马达，跳过 " + kind)
             return
         }
-        val amplitude = settings.amplitude.coerceIn(1, VibrationEffect.DEFAULT_AMPLITUDE)
+        // 注意：VibrationEffect.DEFAULT_AMPLITUDE 在部分 android.jar 中为 -1，
+        // 不能当作上界（coerceIn 在 max < min 时会抛 IllegalArgumentException）。
+        // amplitude 的合法范围固定为 1..255（VibrationSettings.MAX_AMPLITUDE）。
+        val amplitude = settings.amplitude.coerceIn(1, VibrationSettings.MAX_AMPLITUDE)
         try {
             vibrator.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
         } catch (t: Throwable) {
