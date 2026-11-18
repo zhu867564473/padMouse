@@ -3,6 +3,7 @@ package com.fseven.padmouse
 import android.os.Build
 import android.os.IBinder
 import android.os.Process
+import android.util.Log
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
@@ -55,7 +56,11 @@ class PadMouseUserService : IPadMouse.Stub() {
 
     /** M12：UHID 虚拟鼠标；fd、上报与销毁全部在 shell 进程内。 */
     private val uhidLock = Any()
-    private var uhidMouse: UhidMouse? = null
+    /** 主屏设备（uniq 空、BUS_VIRTUAL）与副屏设备（uniq=副屏 id、BUS_USB）同时存在。 */
+    private var primaryMouse: UhidMouse? = null
+    private var secondaryMouse: UhidMouse? = null
+    /** 0 = 主屏设备在发事件；1 = 副屏设备。 */
+    private var activeIndex = 0
 
     /** M13：手柄 FF_RUMBLE 下发状态；到时自动 stop + destroy。 */
     private val rumbleLock = Any()
@@ -269,32 +274,102 @@ class PadMouseUserService : IPadMouse.Stub() {
 
     // ---------------------------------------------------------------- M12 UHID 虚拟鼠标
 
-    override fun createUhidMouse(): String = synchronized(uhidLock) {
-        val mouse = uhidMouse ?: UhidMouse().also { uhidMouse = it }
-        mouse.create()
+    override fun createUhidMouse(uniq: String): String = synchronized(uhidLock) {
+        destroyLocked()
+        // 主屏设备必须用主屏自己的 uniqueId，不能用空串：
+        // 空 uniq 在系统里表示「未指定」，会关联到最近的活动显示（往往是副屏），
+        // 导致切回主屏时光标仍留在副屏。
+        val primaryUniq = primaryDisplayUniqueId()
+        val primary = UhidMouse()
+        val primaryStatus = primary.create(primaryUniq, secondary = false)
+        primaryMouse = if (primaryStatus.startsWith("active=true")) primary else null
+        if (primaryMouse == null) runCatching { primary.destroy() }
+
+        // 副屏设备：uniq 非空时才创建。两个设备同时存在，切换只改活跃指针。
+        if (uniq.isNotEmpty()) {
+            val secondary = UhidMouse()
+            val secStatus = secondary.create(uniq, secondary = true)
+            secondaryMouse = if (secStatus.startsWith("active=true")) secondary else null
+            if (secondaryMouse == null) runCatching { secondary.destroy() }
+        } else {
+            secondaryMouse = null
+        }
+        activeIndex = 0
+        Log.i(
+            "PadMouseUser",
+            "UHID 双设备：primary=${primaryMouse != null}($primaryUniq) secondary=${secondaryMouse != null}($uniq)"
+        )
+        primaryMouse?.status() ?: "ERROR: 主屏设备创建失败"
     }
 
-    override fun destroyUhidMouse() {
+    /** 主屏（displayId 0）的 uniqueId；空串表示取不到。 */
+    private fun primaryDisplayUniqueId(): String = runCatching {
+        val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "dumpsys display 2>/dev/null"))
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.waitFor()
+        Regex("displayId\\s+0[\\s\\S]{0,6000}?uniqueId\\s+\"(local:[^\"]+)\"")
+            .find(out)?.groupValues?.get(1).orEmpty()
+    }.getOrDefault("")
+
+    override fun setActiveUhid(which: Int) {
         synchronized(uhidLock) {
-            uhidMouse?.destroy()
-            uhidMouse = null
+            activeIndex = if (which == 1 && secondaryMouse != null) 1 else 0
+            Log.i("PadMouseUser", "活跃设备 → ${if (activeIndex == 1) "副屏" else "主屏"}")
         }
     }
 
+    override fun secondaryUhidReady(): Boolean = synchronized(uhidLock) {
+        secondaryMouse?.status()?.startsWith("active=true") == true
+    }
+
+    /**
+     * 查外接屏（副屏）的 uniqueId。
+     *
+     * Display.getUniqueId() 是 hidden API，普通 App 反射会被 hiddenapi 拦截；
+     * 这里跑在 shell 进程里，直接执行 dumpsys display 解析，最稳。
+     */
+    override fun externalDisplayUniqueId(): String = runCatching {
+        val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "dumpsys display 2>/dev/null"))
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.waitFor()
+        // DisplayInfo 里形如：displayId 2, ... uniqueId "local:4626..."
+        val pairs = Regex("displayId\\s+(\\d+)[\\s\\S]{0,4000}?uniqueId\\s+\"(local:[^\"]+)\"")
+            .findAll(out)
+            .map { it.groupValues[1].toInt() to it.groupValues[2] }
+            .toList()
+        Log.i("PadMouseUser", "display uniqueIds=" + pairs.joinToString { "${it.first}:${it.second}" })
+        pairs.firstOrNull { it.first != 0 }?.second ?: ""
+    }.getOrDefault("")
+
+    override fun destroyUhidMouse() {
+        synchronized(uhidLock) { destroyLocked() }
+    }
+
+    private fun destroyLocked() {
+        primaryMouse?.destroy()
+        primaryMouse = null
+        secondaryMouse?.destroy()
+        secondaryMouse = null
+        activeIndex = 0
+    }
+
+    private fun activeMouseLocked(): UhidMouse? =
+        if (activeIndex == 1) secondaryMouse else primaryMouse
+
     override fun uhidMouseMove(dx: Int, dy: Int) {
-        synchronized(uhidLock) { uhidMouse?.move(dx, dy) }
+        synchronized(uhidLock) { activeMouseLocked()?.move(dx, dy) }
     }
 
     override fun uhidMouseButton(buttonMask: Int) {
-        synchronized(uhidLock) { uhidMouse?.setButtons(buttonMask) }
+        synchronized(uhidLock) { activeMouseLocked()?.setButtons(buttonMask) }
     }
 
     override fun uhidMouseWheel(delta: Int) {
-        synchronized(uhidLock) { uhidMouse?.wheel(delta) }
+        synchronized(uhidLock) { activeMouseLocked()?.wheel(delta) }
     }
 
     override fun uhidStatus(): String = synchronized(uhidLock) {
-        uhidMouse?.status() ?: "active=false (not created)"
+        activeMouseLocked()?.status() ?: "active=false (not created)"
     }
 
     override fun describeGamepads(): String {

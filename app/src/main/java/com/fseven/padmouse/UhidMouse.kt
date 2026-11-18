@@ -70,7 +70,7 @@ class UhidMouse {
      *
      * @return 状态串：成功 `active=true ...`，失败 `ERROR: 原因`（调用方据此决定是否回退）。
      */
-    fun create(): String {
+    fun create(uniq: String = "", secondary: Boolean = false): String {
         synchronized(lock) {
             if (created && output != null) return statusLocked()
 
@@ -91,7 +91,7 @@ class UhidMouse {
                 output = stream
 
                 // 写 UHID_CREATE2：内核返回错误（EINVAL 等）时 FileOutputStream 抛 IOException。
-                val packet = buildCreate2Packet()
+                val packet = buildCreate2Packet(uniq, secondary)
                 Log.i(TAG, "create: writing UHID_CREATE2 ${packet.size}B (header=$CREATE2_HEADER_SIZE desc=${REPORT_DESCRIPTOR.size})")
                 stream.write(packet)
                 stream.flush()
@@ -246,21 +246,26 @@ class UhidMouse {
     }
 
     /** type + name[128] + phys[64] + uniq[64] + rd_size + bus + vendor/product/version/country + rd。 */
-    private fun buildCreate2Packet(): ByteArray {
+    private fun buildCreate2Packet(uniq: String, secondary: Boolean): ByteArray {
         val descriptor = REPORT_DESCRIPTOR
         val buffer = ByteBuffer.allocate(CREATE2_HEADER_SIZE + descriptor.size)
             .order(ByteOrder.LITTLE_ENDIAN)
         buffer.putInt(UHID_CREATE2)
         buffer.put(fixedString(DEVICE_NAME, 128))
         buffer.put(fixedString(PHYS, 64))
-        buffer.put(ByteArray(64)) // uniq：留空
+        // uniq 决定设备关联到哪块显示：传副屏的 uniqueId → 光标画到副屏；
+        // 空串 → 不关联任何显示 → 光标固定在主屏。
+        buffer.put(fixedString(uniq, 64))
         buffer.putShort(descriptor.size.toShort())
-        // BUS_VIRTUAL 与 scrcpy 的 UHID 鼠标完全一致：
-        // dumpsys diff 显示 scrcpy 是 IsExternal=false，而 USB/蓝牙总线会变成 true，
-        // 外部设备在拿不到 AssociatedDisplay 时 DisplayId 停在 -1，系统不画光标。
-        buffer.putShort(BUS_VIRTUAL.toShort())
+        // 主/副屏两个设备必须显式区分（不能用 uniq 是否为空判断，
+        // 主屏设备也会带自己的 uniqueId）：
+        // - 主屏：BUS_VIRTUAL → IsExternal=false，系统把光标画在主屏；
+        // - 副屏：BUS_USB + 副屏 uniq → IsExternal=true，系统关联到副屏；
+        // product 也区分开，避免两个设备 descriptor 相同。
+        val bus = if (secondary) BUS_USB else BUS_VIRTUAL
+        buffer.putShort(bus.toShort())
         buffer.putInt(VENDOR_ID)
-        buffer.putInt(PRODUCT_ID)
+        buffer.putInt(if (secondary) PRODUCT_ID_SECONDARY else PRODUCT_ID)
         buffer.putInt(VERSION)
         buffer.putInt(COUNTRY)
         buffer.put(descriptor)
@@ -298,11 +303,13 @@ class UhidMouse {
         private const val TAG = "UhidMouse"
 
         private const val UHID_PATH = "/dev/uhid"
-        private const val DEVICE_NAME = "scrcpy"
+        private const val DEVICE_NAME = "PadMouse Virtual Mouse"
         // phys 留空，与 scrcpy 完全一致。
         // 填 "padmouse/uhid" 会让 InputReader 记录成自定义 Location，
         // 实测会导致部分 App（微信/微信读书）不绘制系统光标。
         private const val PHYS = ""
+        /** 诊断用：XREAL 眼镜副屏的 uniqueId（displayId=2）。留空则光标固定在主屏。 */
+        private const val DEBUG_UNIQ_EXTERNAL = "local:4626964072776107781"
 
         // 常量取自 include/uapi/linux/uhid.h（见类注释）。
         private const val UHID_DESTROY = 1
@@ -317,6 +324,9 @@ class UhidMouse {
         // 不做指针光标渲染；换成 0/0 后与 scrcpy 行为一致（微信/微信读书内可见系统光标）。
         private const val VENDOR_ID = 0x0000
         private const val PRODUCT_ID = 0x0000
+        /** 副屏模式用不同的 vendor/product，让 descriptor 与主屏模式不同。 */
+        private const val VENDOR_ID_SECONDARY = 0x0000
+        private const val PRODUCT_ID_SECONDARY = 0x0002
         private const val VERSION = 0
         private const val COUNTRY = 0
 

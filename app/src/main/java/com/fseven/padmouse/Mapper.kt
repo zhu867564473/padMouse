@@ -120,6 +120,8 @@ class Mapper(
         fun onCursor(x: Float, y: Float) {}
         fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {}
         fun onAction(action: MapperAction, atMillis: Long) {}
+        /** LT + RT 同时按下（组合热键，用于切换主屏/副屏）。 */
+        fun onTriggerChord() {}
     }
 
     private var running = false
@@ -159,6 +161,11 @@ class Mapper(
 
     private var primaryHeld = false
     private var secondaryHeld = false
+    /** 扳机按下的滞回状态，用于识别 LT+RT 组合热键。 */
+    private var leftTriggerActive = false
+    private var rightTriggerActive = false
+    /** 组合热键每次按下只触发一次，松开后再复位。 */
+    private var triggerChordFired = false
 
     /** 当前物理按下的键（用于组合键判定）。 */
     private val heldKeys = LinkedHashSet<Int>()
@@ -526,7 +533,33 @@ class Mapper(
     private fun updateHold(action: MouseAction, normalized: Float) {
         val press = normalized >= config.triggerThreshold
         val release = normalized <= config.triggerThreshold * DefaultBindings.TRIGGER_RELEASE_RATIO
-        // 诊断：扳机轴驱动左/右键时记录数值，用于定位「随机点击」是哪个轴在抖。
+
+        // 扳机组合热键：LT + RT 同时按下 → 切换主屏/副屏，期间不产生左右键。
+        when (action) {
+            MouseAction.LEFT_HOLD -> if (press) leftTriggerActive = true else if (release) leftTriggerActive = false
+            MouseAction.RIGHT_HOLD -> if (press) rightTriggerActive = true else if (release) rightTriggerActive = false
+            else -> Unit
+        }
+        if (leftTriggerActive && rightTriggerActive) {
+            if (!triggerChordFired) {
+                triggerChordFired = true
+                listener?.onTriggerChord()
+            }
+            // 组合期间吞掉按键动作，避免同时按下左右键。
+            if (primaryHeld) {
+                primaryHeld = false
+                if (inputMode == InputMode.UHID) refreshUhidButtons()
+                else injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_PRIMARY)
+            }
+            if (secondaryHeld) {
+                secondaryHeld = false
+                if (inputMode == InputMode.UHID) refreshUhidButtons()
+                else injector.mouseUp(cursorX, cursorY, MotionEvent.BUTTON_SECONDARY)
+            }
+            return
+        }
+        if (!leftTriggerActive && !rightTriggerActive) triggerChordFired = false
+
         Log.d("PadMouseMapper", "updateHold action=$action value=$normalized press=$press release=$release held=$primaryHeld/$secondaryHeld")
         when (action) {
             MouseAction.LEFT_HOLD -> {

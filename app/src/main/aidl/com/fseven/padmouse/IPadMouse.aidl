@@ -42,7 +42,21 @@ interface IPadMouse {
     // M12 UHID 虚拟鼠标：在 UserService（shell 进程）内打开 /dev/uhid，
     // 创建系统级 HID 相对鼠标（3 键 + 滚轮，4 字节 report）。
     // createUhidMouse 返回状态串；成功以 "active=true" 开头，失败以 "ERROR:" 开头。
-    String createUhidMouse();
+    // uniq 为副屏 uniqueId（可为空 = 无副屏）。
+    // 实现侧会同时创建两个设备：主屏设备（uniq 空、BUS_VIRTUAL）与副屏设备
+    // （uniq=该值、BUS_USB）。两个设备的 DisplayId 在创建时固定，之后不再重建，
+    // 切换光标本屏/副屏只是改「哪个设备在发事件」，避免 descriptor 缓存导致切不回来。
+    String createUhidMouse(String uniq);
+    /** 切换活跃设备：0 = 主屏设备，1 = 副屏设备（未创建则忽略）。 */
+    void setActiveUhid(int which);
+    /** 副屏设备是否已就绪。 */
+    boolean secondaryUhidReady();
+    /**
+     * 查出外接屏（副屏）的 uniqueId，用于把光标切到副屏。
+     * 返回空串表示没有外接屏。
+     * 放在 shell 进程里做：Display.getUniqueId() 是 hidden API，普通 App 反射会被拦。
+     */
+    String externalDisplayUniqueId();
     void destroyUhidMouse();
     // 相对位移（像素）；实现侧按 HID int8 上限 ±127 拆分多次上报。
     void uhidMouseMove(int dx, int dy);

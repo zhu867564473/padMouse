@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
+import android.hardware.display.DisplayManager
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
@@ -232,6 +233,10 @@ class MouseService : Service() {
 
         override fun onVector(leftX: Float, leftY: Float, rightX: Float, rightY: Float) {
             MouseRuntime.setVector(leftX, leftY, rightX, rightY)
+        }
+
+        override fun onTriggerChord() {
+            toggleCursorDisplay()
         }
 
         override fun onAction(action: MapperAction, atMillis: Long) {
@@ -717,11 +722,12 @@ class MouseService : Service() {
         uhidBinderField?.get(serviceManager) as? IPadMouse
     }.getOrNull()
 
-    private fun createUhidDevice(): String {
+    private fun createUhidDevice(uniq: String = ""): String {
+        Log.i(TAG, "createUhidDevice uniq=[$uniq] bus=${if (uniq.isEmpty()) "VIRTUAL" else "USB"}")
         val binder = uhidBinder() ?: return "ERROR: UserService 未连接"
         // AIDL 返回值是平台类型（String!），实际可能为 null；必须显式兜底，
         // 否则后续 status.startsWith("ERROR") 会抛 NPE 让整个服务启动崩溃。
-        val status = runCatching { binder.createUhidMouse() }.getOrNull()
+        val status = runCatching { binder.createUhidMouse(uniq) }.getOrNull()
         if (status.isNullOrBlank()) return "ERROR: UHID 创建未返回状态（UserService 未就绪）"
         return status
     }
@@ -731,6 +737,72 @@ class MouseService : Service() {
             runCatching { binder.destroyUhidMouse() }
                 .onFailure { Log.d(TAG, "销毁 UHID 设备失败（可能已断开）", it) }
         }
+    }
+
+    // ---------------------------------------------------------------- 主屏 / 副屏切换
+
+    /** 光标当前是否在副屏（决定哪个 UHID 设备在发事件）。 */
+    private var onSecondary = false
+
+    /**
+     * LT + RT 同时按下 → 在主屏与副屏之间切换光标。
+     *
+     * UHID 设备的 DisplayId 在创建时由 uniq 决定，运行时改不了，
+     * 所以这里销毁设备后用新的 uniq 重建。
+     */
+    private fun toggleCursorDisplay() {
+        if (inputMode != InputMode.UHID) return
+        val binder = uhidBinder() ?: return
+
+        if (!onSecondary) {
+            // 主屏 → 副屏：确保副屏设备已创建（启动时没插眼镜则此刻补建）。
+            if (!ensureSecondaryUhid(binder)) {
+                handler.post { Toast.makeText(this, R.string.cursor_display_none, Toast.LENGTH_SHORT).show() }
+                return
+            }
+            onSecondary = true
+            runCatching { binder.setActiveUhid(1) }
+        } else {
+            onSecondary = false
+            runCatching { binder.setActiveUhid(0) }
+        }
+        Log.i(TAG, "光标切屏 → ${if (onSecondary) "副屏" else "主屏"}")
+        handler.post {
+            Toast.makeText(
+                this,
+                if (onSecondary) R.string.cursor_display_secondary else R.string.cursor_display_primary,
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    /**
+     * 确保副屏 UHID 设备已建好（主屏设备 + 副屏设备同时存在）。
+     *
+     * 两个设备只在启动时创建一次；切换只改活跃指针，不销毁重建，
+     * 避免 descriptor 相同导致系统复用旧的显示关联。
+     */
+    private fun ensureSecondaryUhid(binder: IPadMouse): Boolean {
+        val status = runCatching { binder.uhidStatus() }.getOrNull().orEmpty()
+        if (uhidSecondaryReady(binder)) return true
+        val uniq = findExternalDisplayUniqueId() ?: return false
+        // 重建两个设备：createUhidMouse 内部会同时创建主屏与副屏。
+        destroyUhidDevice()
+        appliedInputMode = null
+        applyInputBackend(InputMode.UHID, force = true)
+        return uhidSecondaryReady(binder)
+    }
+
+    /** 副屏设备是否就绪（以 UserService 的实际日志状态为准）。 */
+    private fun uhidSecondaryReady(binder: IPadMouse): Boolean =
+        runCatching { binder.secondaryUhidReady() }.getOrDefault(false)
+
+    /** 查外接屏的 uniqueId（交给 UserService：hidden API 在 shell 进程里可用）。 */
+    private fun findExternalDisplayUniqueId(): String? {
+        val binder = uhidBinder() ?: return null
+        val uniq = runCatching { binder.externalDisplayUniqueId() }.getOrNull()
+        Log.i(TAG, "外接屏 uniqueId=$uniq")
+        return uniq?.takeIf { it.isNotBlank() }
     }
 
     /**
@@ -753,7 +825,8 @@ class MouseService : Service() {
             // UserService 侧可能已成功创建但返回空串，会导致「设备存在却判定失败」，
             // 于是触摸注入继续跑、自绘光标不隐藏，出现两个输入源打架（乱点击 + 滚轮失效）。
             // 一律以 UserService 里的实际设备状态为准。
-            val created = createUhidDevice()
+            // createUhidMouse 内部同时建主屏 + 副屏两个设备；这里把副屏 uniq 传下去。
+            val created = createUhidDevice(findExternalDisplayUniqueId() ?: "")
             val actual = runCatching { uhidBinder()?.uhidStatus() }.getOrNull().orEmpty().trim()
             val ok = actual.startsWith("active=true")
             Log.i(TAG, "applyInputBackend UHID: create=[$created] actual=[$actual] ok=$ok")
@@ -763,6 +836,8 @@ class MouseService : Service() {
                 setOverlayVisible(false)
                 MouseService.setUhidState(true, actual)
                 Log.i(TAG, "UHID 虚拟鼠标就绪: $actual")
+                // 恢复切屏前的活跃设备（两个设备都已创建）。
+                runCatching { uhidBinder()?.setActiveUhid(if (onSecondary) 1 else 0) }
                 // 设备刚就绪时发一次 1px 的往返移动。
                 // 系统（尤其 HyperOS 的 PointerChoreographer）要收到一次真实的指针事件
                 // 才会为这个设备建立光标状态；否则首次切到微信/微信读书时光标不出现，
