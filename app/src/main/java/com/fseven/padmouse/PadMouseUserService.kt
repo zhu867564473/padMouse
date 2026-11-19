@@ -304,12 +304,32 @@ class PadMouseUserService : IPadMouse.Stub() {
 
     /** 主屏（displayId 0）的 uniqueId；空串表示取不到。 */
     private fun primaryDisplayUniqueId(): String = runCatching {
+        displayInfoPairs().firstOrNull { it.first == 0 }?.second.orEmpty()
+    }.getOrDefault("")
+
+    /**
+     * 解析 dumpsys display，取出所有 (displayId, uniqueId)。
+     *
+     * 必须按行解析：每条 DisplayInfo{...} 是完整的一行（2000+ 字符），
+     * 里面同时含 displayId 和 uniqueId。跨行正则会因中间夹着
+     * mBaseDisplayInfo / mOverrideDisplayInfo 两份完整输出而永远匹配不到。
+     */
+    private fun displayInfoPairs(): List<Pair<Int, String>> = runCatching {
         val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "dumpsys display 2>/dev/null"))
         val out = proc.inputStream.bufferedReader().use { it.readText() }
         proc.waitFor()
-        Regex("displayId\\s+0[\\s\\S]{0,6000}?uniqueId\\s+\"(local:[^\"]+)\"")
-            .find(out)?.groupValues?.get(1).orEmpty()
-    }.getOrDefault("")
+        val idRe = Regex("displayId\\s+(\\d+)")
+        val uniqRe = Regex("uniqueId\\s+\"([^\"]+)\"")
+        out.lineSequence()
+            .filter { it.contains("DisplayInfo{") }
+            .mapNotNull { line ->
+                val id = idRe.find(line)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
+                val uniq = uniqRe.find(line)?.groupValues?.get(1) ?: return@mapNotNull null
+                id to uniq
+            }
+            .distinctBy { it.first }
+            .toList()
+    }.getOrDefault(emptyList())
 
     override fun setActiveUhid(which: Int) {
         synchronized(uhidLock) {
@@ -329,17 +349,36 @@ class PadMouseUserService : IPadMouse.Stub() {
      * 这里跑在 shell 进程里，直接执行 dumpsys display 解析，最稳。
      */
     override fun externalDisplayUniqueId(): String = runCatching {
-        val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "dumpsys display 2>/dev/null"))
-        val out = proc.inputStream.bufferedReader().use { it.readText() }
-        proc.waitFor()
-        // DisplayInfo 里形如：displayId 2, ... uniqueId "local:4626..."
-        val pairs = Regex("displayId\\s+(\\d+)[\\s\\S]{0,4000}?uniqueId\\s+\"(local:[^\"]+)\"")
-            .findAll(out)
-            .map { it.groupValues[1].toInt() to it.groupValues[2] }
-            .toList()
+        val pairs = displayInfoPairs()
         Log.i("PadMouseUser", "display uniqueIds=" + pairs.joinToString { "${it.first}:${it.second}" })
         pairs.firstOrNull { it.first != 0 }?.second ?: ""
     }.getOrDefault("")
+
+    /** 诊断文本：把解析到的每块屏（id/类型/uniqueId/是否 presentation）拼成一行行。 */
+    override fun displayDiagnostics(): String = runCatching {
+        val proc = Runtime.getRuntime().exec(arrayOf("sh", "-c", "dumpsys display 2>/dev/null"))
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.waitFor()
+        val idRe = Regex("displayId\\s+(\\d+)")
+        val uniqRe = Regex("uniqueId\\s+\"([^\"]+)\"")
+        val typeRe = Regex("type\\s+(INTERNAL|EXTERNAL|VIRTUAL|OVERLAY|WIFI)")
+        val nameRe = Regex("DisplayInfo\\{\"([^\"]*)\"")
+        val lines = out.lineSequence()
+            .filter { it.contains("DisplayInfo{") }
+            .mapNotNull { line ->
+                val id = idRe.find(line)?.groupValues?.get(1) ?: return@mapNotNull null
+                val uniq = uniqRe.find(line)?.groupValues?.get(1) ?: "<无 uniqueId>"
+                val type = typeRe.find(line)?.groupValues?.get(1) ?: "?"
+                val name = nameRe.find(line)?.groupValues?.get(1) ?: "?"
+                val pres = if (line.contains("FLAG_PRESENTATION")) "PRESENTATION" else "-"
+                "id=$id [$type] \"$name\" uniq=$uniq $pres"
+            }
+            .distinct()
+            .toList()
+        Log.i("PadMouseUser", "displayDiagnostics:\n" + lines.joinToString("\n"))
+        if (lines.isEmpty()) "没有解析到任何 DisplayInfo（dumpsys display 输出格式可能变了）"
+        else "检测到 ${lines.size} 条屏幕信息:\n" + lines.joinToString("\n")
+    }.getOrDefault("诊断失败")
 
     override fun destroyUhidMouse() {
         synchronized(uhidLock) { destroyLocked() }

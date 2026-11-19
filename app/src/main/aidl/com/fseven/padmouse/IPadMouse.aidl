@@ -57,6 +57,11 @@ interface IPadMouse {
      * 放在 shell 进程里做：Display.getUniqueId() 是 hidden API，普通 App 反射会被拦。
      */
     String externalDisplayUniqueId();
+    /**
+     * 诊断用：把 dumpsys display 解析出的所有屏幕信息拼成一段可读文本，
+     * 供 App 在切屏失败时直接弹给用户看（不需要连 adb）。
+     */
+    String displayDiagnostics();
     void destroyUhidMouse();
     // 相对位移（像素）；实现侧按 HID int8 上限 ±127 拆分多次上报。
     void uhidMouseMove(int dx, int dy);

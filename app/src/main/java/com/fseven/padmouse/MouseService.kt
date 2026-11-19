@@ -757,7 +757,12 @@ class MouseService : Service() {
         if (!onSecondary) {
             // 主屏 → 副屏：确保副屏设备已创建（启动时没插眼镜则此刻补建）。
             if (!ensureSecondaryUhid(binder)) {
-                handler.post { Toast.makeText(this, R.string.cursor_display_none, Toast.LENGTH_SHORT).show() }
+                // 切屏失败时把实际探测到的屏幕信息直接弹出来，方便用户不看 adb 也能反馈。
+                val diag = runCatching { binder.displayDiagnostics() }.getOrNull().orEmpty()
+                Log.w(TAG, "切屏失败，屏幕诊断:\n$diag")
+                handler.post {
+                    Toast.makeText(this, "未检测到副屏\n$diag", Toast.LENGTH_LONG).show()
+                }
                 return
             }
             onSecondary = true
